@@ -57,7 +57,9 @@
 #define SMS_MOTOROLA_INTERNAL_HEADER_SIZE      10U
 #define SMS_STANDARD_TEXT_OFFSET               32U
 #define SMS_STANDARD_UDP_PORT                0x1398U
-#define SMS_RX_MAX_PAYLOAD_BYTES      (SMS_MAX_RX_DATA_BLOCKS * SMS_BLOCK_DATA_BYTES)
+// Sized for the larger rate-3/4 block payload (16 bytes/block, see SMS_RATE34_DATA_LENGTH in
+// HR-C6000.h), not the rate-1/2 SMS_BLOCK_DATA_BYTES (12) this firmware's own TX encoding uses.
+#define SMS_RX_MAX_PAYLOAD_BYTES      (SMS_MAX_RX_DATA_BLOCKS * 16U)
 #define SMS_RX_MIN_UTF16_LE_RUN_CHARS           6U
 #define SMS_WINDOW_NEIGHBORHOOD_RADIUS         12U
 #define SMS_WINDOW_NEIGHBORHOOD_STEP            2U
@@ -3403,7 +3405,7 @@ void smsTick(void)
 	smsSetPendingTxEvent(SMS_TX_EVENT_TIMEOUT);
 }
 
-bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
+bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame, uint8_t frameLength)
 {
 	if (frame == NULL)
 	{
@@ -3504,8 +3506,20 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 
 	if (((dataType == 0x07U) || (dataType == 0x08U)) && rxAssembly.active)
 	{
+		// dataType 0x08 is a rate 3/4 data burst, which carries more payload per block than the
+		// rate 1/2 bursts (dataType 0x07) SMS_BLOCK_DATA_BYTES was sized for -- frameLength
+		// reflects however many bytes HR-C6000.c actually read for this specific burst type
+		// (SMS_RATE34_DATA_LENGTH vs LC_DATA_LENGTH), so derive the payload size from that
+		// instead of the fixed rate-1/2 block size.
 		uint8_t blockHeaderBytes = ((dataType == 0x08U) ? 2U : 0U);
-		uint8_t blockPayloadBytes = (uint8_t)(SMS_BLOCK_DATA_BYTES - blockHeaderBytes);
+
+		if (frameLength <= blockHeaderBytes)
+		{
+			smsResetRxAssembly();
+			return false;
+		}
+
+		uint8_t blockPayloadBytes = (uint8_t)(frameLength - blockHeaderBytes);
 		const uint8_t *blockPayload = &frame[blockHeaderBytes];
 
 		if (rxAssembly.receivedBlocks >= rxAssembly.expectedBlocks)

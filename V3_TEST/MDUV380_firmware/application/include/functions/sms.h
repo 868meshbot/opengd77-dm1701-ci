@@ -105,7 +105,7 @@ smsPackResult_t smsQueueMessage(uint32_t destinationId, uint32_t sourceId, const
 bool smsHasQueuedMessage(void);
 const smsPreparedMessage_t *smsGetQueuedMessage(void);
 void smsClearQueuedMessage(void);
-bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame);
+bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame, uint8_t frameLength);
 uint8_t smsGetInboxCount(void);
 bool smsGetInboxMessage(uint8_t index, smsInboxMessage_t *message);
 bool smsDeleteInboxMessage(uint8_t index);

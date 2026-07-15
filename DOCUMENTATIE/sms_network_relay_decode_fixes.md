@@ -110,11 +110,58 @@ immediately followed by the rest of the message.
 Verified against multiple real captures (`rssi` and `wx swansea, wales`
 queries to DMR ID `262993`) by decoding the complete raw bytes independently
 in Python and confirming an exact match with the firmware's decoded output.
-The remaining "odd" wording in some reports (e.g. "Reter" instead of
-"Repeater", "T26299eportat" instead of "TG262993 Report at") is confirmed to
-be present in the sender's own raw bytes -- i.e. a bug/quirk in that network
-service's own message composition, not something this firmware's receive path
-can or should try to correct.
+
+**This conclusion turned out to be wrong, and was corrected in Symptom 3
+below.** The above only proved that *decoding* the firmware's own already-
+assembled bytes was faithful to those bytes -- it did not prove that
+*reassembling* those bytes from individual DMR blocks in the first place
+was correct. It wasn't: see below.
+
+## Symptom 3: garbled text was actually caused by our own block reassembly, not the sender
+
+The wording noted above ("Reter" instead of "Repeater", "T26299eportat"
+instead of "TG262993 Report at") was wrongly attributed to a bug in
+`262993`'s own message composition. It is not. Enabling verbose MMDVMHost
+logging (`DisplayLevel=1`/`FileLevel=1` under `[Log]` in `MMDVM.ini` --
+level `1` is the *most* verbose, not least) exposes `CUtils::dump()` hex
+dumps of every DMR data header and data block MMDVMHost itself receives,
+independent of this firmware entirely. Reconstructing a "WX Report -
+Swansea" message from those block-level dumps (stripping what turned out to
+be a 2-byte per-block header, then decoding the rest as UTF-16BE) produced a
+perfectly clean, complete report -- proving the sender was never buggy.
+
+**Root cause**: `smsHandleReceivedDataFrame()` treated every inbound DMR
+data block as a fixed `SMS_BLOCK_DATA_BYTES` (12) bytes, whether or not it
+also stripped a 2-byte header for `dataType == 0x08`. Real rate-3/4 DMR data
+bursts (`dataType 0x08`, used for Confirmed Data and Defined Short Data --
+MMDVMHost labels these "Data 3/4" in its log) actually carry **16 bytes** of
+payload per block (18 bytes total), not 10. The firmware was under-reading
+every rate-3/4 block by 6 bytes, silently truncating/misaligning the
+reassembled message -- for a 10-block message that's 60 bytes lost out of
+160, exactly matching the garbling and length shortfall observed.
+
+Confirmed by cross-referencing our own firmware's parsed DPF/pad/block-count
+against MMDVMHost's independent parse of the *same* frame byte-for-byte
+(matched exactly across four separate captures) before concluding the block
+*count* logic was correct and the block *size* assumption was the actual
+bug.
+
+**Fix**: the 12-byte read from the HR-C6000 chip
+(`SPI0ReadPageRegByteArray(0x02, 0x00, dataSyncBuf, LC_DATA_LENGTH)` in
+`HR-C6000.c`) was hardcoded regardless of burst type. Since `rxDataType` is
+already known before that read happens, it now reads
+`SMS_RATE34_DATA_LENGTH` (18) bytes specifically for `rxDataType == 0x08`,
+and passes the actual length read through to `smsHandleReceivedDataFrame()`
+(which gained a `frameLength` parameter) so the per-block payload size is
+derived from real data instead of an assumed constant. The RX reassembly
+buffers (`smsRxPayloadBuffer`/`smsRxDecodePendingPayloadBuffer`) were grown
+accordingly. Verified: `wx swansea, wales` now decodes to the complete,
+correct four-line report.
+
+This was inherently a leap of faith about the HR-C6000 chip's own register
+behaviour (no datasheet access to confirm reading 18 bytes at that SPI
+address yields real data rather than garbage past byte 12) -- it was only
+confirmed correct by trying it on real hardware and checking the result.
 
 ## Re-enabling the debug serial dump
 
