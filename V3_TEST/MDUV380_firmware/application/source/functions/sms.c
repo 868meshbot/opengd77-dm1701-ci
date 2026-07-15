@@ -34,6 +34,14 @@
 #include "hardware/HR-C6000.h"
 #include "hardware/EEPROM.h"
 
+// Dumps SMS TX/RX payload bytes and decode results over the USB CDC debug serial port
+// (USB_DEBUG_printf). Off by default -- flip to 1 to bring it back for wire-format debugging
+// (used to diagnose the network-relayed SMS decode issues; see DOCUMENTATIE/sms_decode_fixes.md).
+#define SMS_DEBUG_USB_SERIAL 0
+#if SMS_DEBUG_USB_SERIAL
+#include "usb/usb_com.h"
+#endif
+
 #define SMS_STORAGE_ADDRESS                    0x0F0000
 #define SMS_STORAGE_MAGIC                      0x534D5349U
 #define SMS_STORAGE_VERSION                    5U
@@ -207,6 +215,9 @@ static smsTxEvent_t pendingTxEvent = SMS_TX_EVENT_NONE;
 static volatile bool smsStorageDirty = false;
 static uint32_t smsStorageDirtySinceTick = 0U;
 
+#if SMS_DEBUG_USB_SERIAL
+static void smsDebugPrintHex(const char *label, const uint8_t *data, uint16_t length);
+#endif
 static void smsResetRxAssembly(void);
 static void smsScheduleAckResponse(uint32_t destinationId, uint8_t ackProfile);
 static bool smsQueueAckResponseMessage(uint32_t destinationId, uint32_t sourceId, uint8_t ackProfile);
@@ -247,6 +258,34 @@ static void smsStorageLoad(void);
 static bool smsShouldAckUndecodedPayload(const uint8_t *payload, uint16_t totalLength, uint8_t padOctets);
 static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLength, uint8_t padOctets, uint32_t sourceId);
 static void smsProcessPendingRxDecode(void);
+
+#if SMS_DEBUG_USB_SERIAL
+static void smsDebugPrintHex(const char *label, const uint8_t *data, uint16_t length)
+{
+	static const char hexDigits[] = "0123456789ABCDEF";
+	char hex[257];
+	uint16_t dumpLength = length;
+
+	if (data == NULL)
+	{
+		return;
+	}
+
+	if (dumpLength > 128U)
+	{
+		dumpLength = 128U;
+	}
+
+	for (uint16_t i = 0U; i < dumpLength; i++)
+	{
+		hex[(i * 2U)] = hexDigits[(data[i] >> 4) & 0x0FU];
+		hex[(i * 2U) + 1U] = hexDigits[data[i] & 0x0FU];
+	}
+	hex[dumpLength * 2U] = 0;
+
+	USB_DEBUG_printf("%s len=%u: %s%s\r\n", label, length, hex, ((length > dumpLength) ? "..." : ""));
+}
+#endif
 
 void smsInit(void)
 {
@@ -1065,6 +1104,91 @@ static bool smsDecodeUtf16Payload(const uint8_t *payload, uint16_t payloadLength
 	return true;
 }
 
+// Whole-buffer UTF-16BE decode, mirroring smsDecodeUtf16Payload() above (which is LE, matching
+// this firmware's own outbound encoding) but for the big-endian, unwrapped plain-text format
+// used by real network-relayed Defined Short Data messages: no IP/UDP header, no offset search,
+// just two-byte-per-character text starting at byte 0. Unlike smsDecodeUtf16BeRun() (a "longest
+// printable run" scanner that stops at the first embedded newline), this walks the whole buffer
+// the same way the LE decoder does, so a multi-line message decodes in one clean pass instead of
+// being reassembled from multiple offset-scanned fragments via smsMergeDecodedCandidate().
+static bool smsDecodeUtf16BePayload(const uint8_t *payload, uint16_t payloadLength, char *textOut)
+{
+	uint16_t outIndex = 0U;
+	uint16_t replacedCount = 0U;
+	uint16_t printableCount = 0U;
+
+	if ((payload == NULL) || (textOut == NULL) || ((payloadLength & 0x01U) != 0U))
+	{
+		return false;
+	}
+
+	for (uint16_t inIndex = 0U; (inIndex + 1U) < payloadLength; inIndex = (uint16_t)(inIndex + 2U))
+	{
+		uint8_t high = payload[inIndex];
+		uint8_t low = payload[inIndex + 1U];
+		uint16_t codepoint = (uint16_t)(((uint16_t)high << 8) | low);
+		char c = '?';
+
+		if (codepoint == 0x0000U)
+		{
+			break;
+		}
+
+		if ((codepoint >= 0x20U) && (codepoint <= 0x7EU))
+		{
+			c = (char)codepoint;
+		}
+		else if (codepoint == 0x0009U)
+		{
+			c = ' ';
+		}
+		else if ((codepoint == 0x000AU) || (codepoint == 0x000DU))
+		{
+			c = '\n';
+		}
+		else
+		{
+			c = smsMapUnicodeToAscii(codepoint);
+		}
+
+		if (outIndex >= SMS_MAX_TEXT_LENGTH)
+		{
+			break;
+		}
+
+		if (c == '?')
+		{
+			replacedCount++;
+		}
+		else
+		{
+			printableCount++;
+		}
+
+		if ((c == '\n') && (outIndex > 0U) && (textOut[outIndex - 1U] == '\n'))
+		{
+			continue;
+		}
+
+		textOut[outIndex++] = c;
+	}
+
+	textOut[outIndex] = 0;
+
+	if ((outIndex == 0U) || (printableCount == 0U))
+	{
+		return false;
+	}
+
+	// Reject random binary that accidentally contains a small UTF-16BE-like run.
+	if ((replacedCount * 3U) > outIndex)
+	{
+		return false;
+	}
+
+	return true;
+}
+
 static bool smsDecodeAsciiPayload(const uint8_t *payload, uint16_t payloadLength, char *textOut)
 {
 	uint16_t outIndex = 0U;
@@ -1131,6 +1255,29 @@ static uint16_t smsCountCharOccurrence(const char *text, char value)
 	}
 
 	return count;
+}
+
+// Decides whether it's worth trying another, more aggressive decode strategy (offset-scanning,
+// windowed neighborhood search) on top of what's already been decoded. A handful of unmappable
+// characters (e.g. a degree sign) in an otherwise long, clean decode is not "poor quality" --
+// treating it as such lets a later stage's candidate get spliced into this one character-by-
+// character via smsMergeDecodedCandidate(), which can overwrite/drop correctly-decoded text with
+// fragments from a completely different (wrong) alignment. Only keep looking when a significant
+// fraction of the text is actually unrecognised.
+static bool smsDecodedTextIsPoor(const char *decodedText)
+{
+	uint16_t length;
+	uint16_t questionCount;
+
+	if ((decodedText == NULL) || (decodedText[0] == 0))
+	{
+		return true;
+	}
+
+	length = (uint16_t)strlen(decodedText);
+	questionCount = smsCountCharOccurrence(decodedText, '?');
+
+	return ((questionCount * 5U) > length);
 }
 
 static int32_t smsScoreDecodedText(const char *text)
@@ -1328,7 +1475,24 @@ static bool smsTryAdoptDecodedCandidate(char *decodedText, const char *candidate
 		return false;
 	}
 
-	if ((decodedText[0] == 0) || smsIsBetterDecodedCandidate(decodedText, candidateText))
+	if (decodedText[0] == 0)
+	{
+		// Nothing decoded yet is not a licence to adopt just anything: a permissive decode
+		// attempt (e.g. ASCII, which accepts any printable byte) can produce a short spurious
+		// match against header/framing noise. Hold the first candidate to the same quality bar
+		// (smsScoreDecodedText() rejects anything under 3 characters as garbage) as every
+		// subsequent comparison already uses.
+		if (smsScoreDecodedText(candidateText) <= -32768)
+		{
+			return false;
+		}
+
+		strncpy(decodedText, candidateText, SMS_MAX_TEXT_LENGTH);
+		decodedText[SMS_MAX_TEXT_LENGTH] = 0;
+		return true;
+	}
+
+	if (smsIsBetterDecodedCandidate(decodedText, candidateText))
 	{
 		strncpy(decodedText, candidateText, SMS_MAX_TEXT_LENGTH);
 		decodedText[SMS_MAX_TEXT_LENGTH] = 0;
@@ -1344,8 +1508,6 @@ static bool smsTryDecodeWindowDirect(const uint8_t *payload, uint16_t payloadLen
 	uint16_t utf16Length;
 	bool improved = false;
 
-	(void)allowAscii;
-
 	if ((payload == NULL) || (decodedText == NULL) || (scratchText == NULL) || (payloadLength == 0U))
 	{
 		return false;
@@ -1359,6 +1521,14 @@ static bool smsTryDecodeWindowDirect(const uint8_t *payload, uint16_t payloadLen
 
 	utf16Length = (uint16_t)(boundedLength & 0xFFFEU);
 	if ((utf16Length >= 2U) && smsDecodeUtf16Payload(payload, utf16Length, scratchText))
+	{
+		improved |= smsTryAdoptDecodedCandidate(decodedText, scratchText);
+	}
+
+	// Some senders (e.g. Defined Short Data messages relayed from a network gateway) carry
+	// plain 8-bit text with no IP/UDP wrapper at all, so there's no UTF-16 to find here. Try
+	// that too when the caller has indicated this window is a plausible text window.
+	if (allowAscii && smsDecodeAsciiPayload(payload, payloadLength, scratchText))
 	{
 		improved |= smsTryAdoptDecodedCandidate(decodedText, scratchText);
 	}
@@ -2627,6 +2797,23 @@ smsPackResult_t smsQueueMessage(uint32_t destinationId, uint32_t sourceId, const
 {
 	smsPackResult_t result = smsPackMessage(destinationId, sourceId, text, &queuedMessage);
 	queuedMessageValid = (result == SMS_PACK_OK);
+
+#if SMS_DEBUG_USB_SERIAL
+	if (queuedMessageValid)
+	{
+		uint8_t flatPayload[SMS_MAX_DATA_BLOCKS * SMS_BLOCK_DATA_BYTES];
+		uint16_t flatLength = (uint16_t)(queuedMessage.blockCount * SMS_BLOCK_DATA_BYTES);
+
+		for (uint8_t block = 0U; block < queuedMessage.blockCount; block++)
+		{
+			memcpy(&flatPayload[(uint16_t)block * SMS_BLOCK_DATA_BYTES], queuedMessage.blocks[block], SMS_BLOCK_DATA_BYTES);
+		}
+
+		USB_DEBUG_printf("SMS TX to=%lu from=%lu text=\"%s\"\r\n", (unsigned long)destinationId, (unsigned long)sourceId, text);
+		smsDebugPrintHex("SMS TX payload", flatPayload, flatLength);
+	}
+#endif
+
 	return result;
 }
 
@@ -2843,6 +3030,11 @@ static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLeng
 		return false;
 	}
 
+#if SMS_DEBUG_USB_SERIAL
+	USB_DEBUG_printf("SMS RX from=%lu totalLength=%u padOctets=%u\r\n", (unsigned long)sourceId, totalLength, padOctets);
+	smsDebugPrintHex("SMS RX payload", payload, totalLength);
+#endif
+
 	for (uint8_t i = 0U; i < SMS_DECODE_BUF_COUNT; i++)
 	{
 		smsDecodeTextBuffers[i][0] = 0;
@@ -2874,7 +3066,11 @@ static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLeng
 	payloadLength = (uint16_t)(totalLength - effectivePadOctets);
 	textDecodeLength = payloadLength;
 
-	if (payloadLength >= 4U)
+	// Only trust byte[2:3] as an IP packet length field when this actually looks like an IPv4
+	// header (version 4, IHL 5, i.e. payload[0] == 0x45) -- otherwise those two bytes can be
+	// anything (e.g. the first two text characters of an unwrapped plain-text message) and
+	// coincidentally fall in-range, wrongly truncating the scan window for the real content.
+	if ((payloadLength >= 4U) && (payload[0] == 0x45U))
 	{
 		ipPacketLength = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
 		if ((ipPacketLength >= 20U) && (ipPacketLength <= payloadLength))
@@ -2961,7 +3157,7 @@ static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLeng
 	}
 
 	// Stage 2: direct decode in likely text windows (no brute-force raw replay).
-	if ((decodedText[0] == 0) || (smsCountCharOccurrence(decodedText, '?') > 0U))
+	if (smsDecodedTextIsPoor(decodedText))
 	{
 		if ((hasMotorolaSignature || hasMotorolaPort) && (motorolaTextOffsetLength > 0U))
 		{
@@ -3016,21 +3212,48 @@ static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLeng
 	}
 
 	// Stage 3: expensive full-payload scans only when quality is still poor.
-	if (((decodedText[0] == 0) || (smsCountCharOccurrence(decodedText, '?') > 0U)) &&
+
+	// Try a clean, direct whole-buffer UTF-16BE read first: real network-relayed Defined Short
+	// Data messages are plain BE text with no framing at all starting at byte 0 (confirmed from
+	// an on-air capture), and a single clean decode here is far less likely to produce a
+	// scrambled result than falling through to the offset-scanning/merge-based fallbacks below.
+	if ((smsDecodedTextIsPoor(decodedText)) &&
+		smsDecodeUtf16BePayload(scanPayload, (uint16_t)(scanLength & 0xFFFEU), scratchText) &&
+		smsTryAdoptDecodedCandidate(decodedText, scratchText))
+	{
+		// Candidate accepted by quality score.
+	}
+
+	if ((smsDecodedTextIsPoor(decodedText)) &&
 		smsDecodeUtf16LeRun(scanPayload, scanLength, scratchText, NULL) &&
 		smsTryAdoptDecodedCandidate(decodedText, scratchText))
 	{
 		// Candidate accepted by quality score.
 	}
 
-	if (((decodedText[0] == 0) || (smsCountCharOccurrence(decodedText, '?') > 0U)) &&
+	if ((smsDecodedTextIsPoor(decodedText)) &&
 		smsDecodeUtf16PayloadByScan(scanPayload, scanLength, scratchText, NULL) &&
 		smsTryAdoptDecodedCandidate(decodedText, scratchText))
 	{
 		// Candidate accepted by quality score.
 	}
 
+	// Last resort: plain 8-bit text with no UTF-16 anywhere in it and no recognised
+	// Motorola/DMR_Standard port or signature (so Stage 2 never ran at all) -- e.g. a raw
+	// Defined Short Data message relayed from a network gateway rather than this firmware's
+	// own IP/UDP-wrapped format.
+	if ((smsDecodedTextIsPoor(decodedText)) &&
+		smsDecodeAsciiPayload(scanPayload, scanLength, scratchText) &&
+		smsTryAdoptDecodedCandidate(decodedText, scratchText))
+	{
+		// Candidate accepted by quality score.
+	}
+
 	decoded = (decodedText[0] != 0);
+
+#if SMS_DEBUG_USB_SERIAL
+	USB_DEBUG_printf("SMS RX decode %s: \"%s\"\r\n", (decoded ? "OK" : "FAILED"), (decoded ? decodedText : ""));
+#endif
 
 	if (decoded)
 	{
@@ -3060,7 +3283,11 @@ static bool smsShouldAckUndecodedPayload(const uint8_t *payload, uint16_t totalL
 	payloadLength = (uint16_t)(totalLength - effectivePadOctets);
 	textDecodeLength = payloadLength;
 
-	if (payloadLength >= 4U)
+	// Only trust byte[2:3] as an IP packet length field when this actually looks like an IPv4
+	// header (version 4, IHL 5, i.e. payload[0] == 0x45) -- otherwise those two bytes can be
+	// anything (e.g. the first two text characters of an unwrapped plain-text message) and
+	// coincidentally fall in-range, wrongly truncating the scan window for the real content.
+	if ((payloadLength >= 4U) && (payload[0] == 0x45U))
 	{
 		ipPacketLength = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
 		if ((ipPacketLength >= 20U) && (ipPacketLength <= payloadLength))

@@ -62,3 +62,14 @@ Dit document beschrijft welke bronbestanden zijn toegevoegd of aangepast voor de
 ## Opmerking
 
 Bestanden in buildmappen (zoals MDUV380_10W_PLUS_FW), tijdelijke testbestanden en tool-output zijn niet functioneel onderdeel van de SMS-implementatie.
+
+## Latere fixes: ontvangst van netwerk-relayed SMS (V3_TEST)
+
+Zie [`sms_network_relay_decode_fixes.md`](sms_network_relay_decode_fixes.md)
+voor een uitgebreide beschrijving van fixes aan de ontvangst-decodering in
+`sms.c` (V3_TEST) voor SMS die via een DMR-netwerk (bijv. BrandMeister/WPSD-
+hotspot) binnenkomen in plaats van rechtstreeks radio-naar-radio: het
+herkennen van Defined Short/Raw Data headers, en het correct decoderen van
+platte UTF-16BE tekst zonder IP/UDP-header. Bevat ook hoe de tijdelijke
+USB-seriële debug-dump (`SMS_DEBUG_USB_SERIAL`, standaard uit) weer aan te
+zetten is voor toekomstig onderzoek.
