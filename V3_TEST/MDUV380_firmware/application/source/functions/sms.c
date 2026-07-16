@@ -180,6 +180,7 @@ typedef struct
 	uint32_t sourceId;
 	ticksTimer_t ackTimer;
 	char text[SMS_MAX_TEXT_LENGTH + 1U];
+	smsEncoderFormat_t format;
 } smsOutgoingTracking_t;
 
 typedef struct
@@ -192,6 +193,7 @@ typedef struct
 	smsTxEvent_t startEvent;
 	ticksTimer_t startTimer;
 	char text[SMS_MAX_TEXT_LENGTH + 1U];
+	smsEncoderFormat_t format;
 } smsOutgoingStartTracking_t;
 
 static uint8_t inboxCount = 0U;
@@ -226,12 +228,13 @@ static bool smsQueueAckResponseMessage(uint32_t destinationId, uint32_t sourceId
 static uint16_t smsCrc16Ccitt(const uint8_t *data, uint8_t length);
 static void smsResetOutgoingTracking(void);
 static void smsResetOutgoingStartTracking(void);
-static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, const char *text, bool waitForAck, smsTxEvent_t startEvent);
-static bool smsScheduleQueuedMessageTransmissionInternal(uint32_t destinationId, uint32_t sourceId, const char *text, bool waitForAck, bool storeSent, smsTxEvent_t startEvent);
+static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, smsTxEvent_t startEvent);
+static bool smsScheduleQueuedMessageTransmissionInternal(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, bool storeSent, smsTxEvent_t startEvent);
 static void smsProcessPendingOutgoingStart(void);
 static void smsSetPendingTxEvent(smsTxEvent_t event);
 static smsPackResult_t smsConvertTextToUtf16LeUpper(const char *text, uint8_t *payload, uint16_t *payloadLength);
 static smsPackResult_t smsBuildMotorolaPayload(uint32_t destinationId, uint32_t sourceId, const char *text, uint8_t *payload, uint16_t *payloadLength, uint8_t *padOctetCount);
+static smsPackResult_t smsBuildStandardPayload(uint32_t destinationId, uint32_t sourceId, const char *text, uint8_t *payload, uint16_t *payloadLength, uint8_t *padOctetCount);
 static bool smsDecodeMotorolaPayload(const uint8_t *payload, uint16_t totalLength, uint8_t padOctets, char *textOut);
 static bool smsDecodeStandardPayload(const uint8_t *payload, uint16_t totalLength, uint8_t padOctets, char *textOut);
 static bool smsDecodeUtf8Payload(const uint8_t *payload, uint16_t payloadLength, char *textOut);
@@ -2419,6 +2422,78 @@ static smsPackResult_t smsBuildMotorolaPayload(uint32_t destinationId, uint32_t 
 	return SMS_PACK_OK;
 }
 
+// DMR_Standard Compatible Format: same IP header as Motorola, UDP port SMS_STANDARD_UDP_PORT, and
+// a much shorter 4-byte internal sub-header (vs Motorola's 10 bytes) before the text -- this is
+// the format Anytone radios identify as "DMR_Standard" in their own menus. Byte layout mirrors
+// smsDecodeStandardPayload()'s expectations exactly (that decoder already works against real
+// captures, so this builder matches it byte-for-byte rather than re-deriving from the spec PDF).
+static void smsBuildStandardUdpHeader(uint8_t *packet, uint16_t textByteLength)
+{
+	uint16_t udpLength = (uint16_t)(textByteLength + 12U);
+	uint16_t checksum;
+
+	packet[20] = (uint8_t)((SMS_STANDARD_UDP_PORT >> 8) & 0xFFU);
+	packet[21] = (uint8_t)(SMS_STANDARD_UDP_PORT & 0xFFU);
+	packet[22] = (uint8_t)((SMS_STANDARD_UDP_PORT >> 8) & 0xFFU);
+	packet[23] = (uint8_t)(SMS_STANDARD_UDP_PORT & 0xFFU);
+	packet[24] = (uint8_t)((udpLength >> 8) & 0xFFU);
+	packet[25] = (uint8_t)(udpLength & 0xFFU);
+	packet[26] = 0x00U;
+	packet[27] = 0x00U;
+	packet[28] = 0x00U;
+	packet[29] = 0x0DU;
+	packet[30] = 0x00U;
+	packet[31] = 0x0AU;
+
+	checksum = smsUdpChecksum(packet, udpLength);
+	packet[26] = (uint8_t)((checksum >> 8) & 0xFFU);
+	packet[27] = (uint8_t)(checksum & 0xFFU);
+}
+
+static smsPackResult_t smsBuildStandardPayload(uint32_t destinationId, uint32_t sourceId, const char *text, uint8_t *payload, uint16_t *payloadLength, uint8_t *padOctetCount)
+{
+	uint8_t utf16Payload[SMS_MAX_UTF16_PAYLOAD_BYTES];
+	uint16_t textByteLength = 0U;
+	uint16_t ipPacketLength;
+	uint16_t crcOffset;
+	uint32_t crc32;
+	smsPackResult_t result;
+
+	if ((payload == NULL) || (payloadLength == NULL) || (padOctetCount == NULL))
+	{
+		return SMS_PACK_ERROR_EMPTY;
+	}
+
+	result = smsConvertTextToUtf16LeUpper(text, utf16Payload, &textByteLength);
+	if (result != SMS_PACK_OK)
+	{
+		return result;
+	}
+
+	ipPacketLength = (uint16_t)(SMS_STANDARD_TEXT_OFFSET + textByteLength);
+	*padOctetCount = (uint8_t)((SMS_BLOCK_DATA_BYTES - ((ipPacketLength + SMS_STANDARD_CRC32_BYTES) % SMS_BLOCK_DATA_BYTES)) % SMS_BLOCK_DATA_BYTES);
+	crcOffset = (uint16_t)(ipPacketLength + *padOctetCount);
+	*payloadLength = (uint16_t)(crcOffset + SMS_STANDARD_CRC32_BYTES);
+
+	if (*payloadLength > SMS_MAX_TRANSPORT_BYTES)
+	{
+		return SMS_PACK_ERROR_TOO_LONG;
+	}
+
+	memset(payload, 0, SMS_MAX_TRANSPORT_BYTES);
+	smsBuildIpHeader(payload, ipPacketLength, sourceId, destinationId);
+	smsBuildStandardUdpHeader(payload, textByteLength);
+	memcpy(&payload[SMS_STANDARD_TEXT_OFFSET], utf16Payload, textByteLength);
+
+	crc32 = smsCrc32Compute(payload, crcOffset);
+	payload[crcOffset] = (uint8_t)(crc32 & 0xFFU);
+	payload[crcOffset + 1U] = (uint8_t)((crc32 >> 8) & 0xFFU);
+	payload[crcOffset + 2U] = (uint8_t)((crc32 >> 16) & 0xFFU);
+	payload[crcOffset + 3U] = (uint8_t)((crc32 >> 24) & 0xFFU);
+
+	return SMS_PACK_OK;
+}
+
 static bool smsDecodeMotorolaPayload(const uint8_t *payload, uint16_t totalLength, uint8_t padOctets, char *textOut)
 {
 	uint16_t ipPacketLength;
@@ -2737,7 +2812,7 @@ static smsPackResult_t smsConvertTextToUtf16LeUpper(const char *text, uint8_t *p
 	return ((index == 0U) ? SMS_PACK_ERROR_EMPTY : SMS_PACK_OK);
 }
 
-smsPackResult_t smsPackMessage(uint32_t destinationId, uint32_t sourceId, const char *text, smsPreparedMessage_t *message)
+smsPackResult_t smsPackMessage(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, smsPreparedMessage_t *message)
 {
 	smsPackResult_t result;
 	uint8_t payload[SMS_MAX_DATA_BLOCKS * SMS_BLOCK_DATA_BYTES];
@@ -2766,7 +2841,15 @@ smsPackResult_t smsPackMessage(uint32_t destinationId, uint32_t sourceId, const 
 	message->requestAck = true;
 	memset(payload, 0, sizeof(payload));
 
-	result = smsBuildMotorolaPayload(destinationId, sourceId, text, payload, &payloadLength, &message->padOctetCount);
+	if (format == SMS_ENCODER_STANDARD)
+	{
+		result = smsBuildStandardPayload(destinationId, sourceId, text, payload, &payloadLength, &message->padOctetCount);
+	}
+	else
+	{
+		result = smsBuildMotorolaPayload(destinationId, sourceId, text, payload, &payloadLength, &message->padOctetCount);
+	}
+
 	if (result != SMS_PACK_OK)
 	{
 		return result;
@@ -2795,12 +2878,14 @@ smsPackResult_t smsPackMessage(uint32_t destinationId, uint32_t sourceId, const 
 	return SMS_PACK_OK;
 }
 
-smsPackResult_t smsQueueMessage(uint32_t destinationId, uint32_t sourceId, const char *text)
+smsPackResult_t smsQueueMessage(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format)
 {
-	smsPackResult_t result = smsPackMessage(destinationId, sourceId, text, &queuedMessage);
+	smsPackResult_t result = smsPackMessage(destinationId, sourceId, text, format, &queuedMessage);
 	queuedMessageValid = (result == SMS_PACK_OK);
 
 #if SMS_DEBUG_USB_SERIAL
+	USB_DEBUG_printf("SMS pack to=%lu from=%lu format=%d result=%d text=\"%s\"\r\n", (unsigned long)destinationId, (unsigned long)sourceId, (int)format, (int)result, text);
+
 	if (queuedMessageValid)
 	{
 		uint8_t flatPayload[SMS_MAX_DATA_BLOCKS * SMS_BLOCK_DATA_BYTES];
@@ -2835,7 +2920,7 @@ void smsClearQueuedMessage(void)
 	memset(&queuedMessage, 0, sizeof(queuedMessage));
 }
 
-static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, const char *text, bool waitForAck, smsTxEvent_t startEvent)
+static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, smsTxEvent_t startEvent)
 {
 	if ((text == NULL) || (text[0] == 0) || (destinationId == 0U) || (sourceId == 0U))
 	{
@@ -2846,6 +2931,7 @@ static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, 
 	outgoingTracking.waitForAck = waitForAck;
 	outgoingTracking.destinationId = destinationId;
 	outgoingTracking.sourceId = sourceId;
+	outgoingTracking.format = format;
 	strncpy(outgoingTracking.text, text, SMS_MAX_TEXT_LENGTH);
 	outgoingTracking.text[SMS_MAX_TEXT_LENGTH] = 0;
 
@@ -2861,7 +2947,7 @@ static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, 
 	smsSetPendingTxEvent(startEvent);
 }
 
-static bool smsScheduleQueuedMessageTransmissionInternal(uint32_t destinationId, uint32_t sourceId, const char *text, bool waitForAck, bool storeSent, smsTxEvent_t startEvent)
+static bool smsScheduleQueuedMessageTransmissionInternal(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, bool storeSent, smsTxEvent_t startEvent)
 {
 	if ((text == NULL) || (text[0] == 0) || (destinationId == 0U) || (sourceId == 0U) || !smsHasQueuedMessage())
 	{
@@ -2879,15 +2965,16 @@ static bool smsScheduleQueuedMessageTransmissionInternal(uint32_t destinationId,
 	outgoingStartTracking.destinationId = destinationId;
 	outgoingStartTracking.sourceId = sourceId;
 	outgoingStartTracking.startEvent = startEvent;
+	outgoingStartTracking.format = format;
 	strncpy(outgoingStartTracking.text, text, SMS_MAX_TEXT_LENGTH);
 	outgoingStartTracking.text[SMS_MAX_TEXT_LENGTH] = 0;
 	ticksTimerStart(&outgoingStartTracking.startTimer, SMS_TX_START_TIMEOUT_MS);
 	return true;
 }
 
-bool smsScheduleQueuedMessageTransmission(uint32_t destinationId, uint32_t sourceId, const char *text, bool waitForAck, bool storeSent)
+bool smsScheduleQueuedMessageTransmission(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, bool storeSent)
 {
-	return smsScheduleQueuedMessageTransmissionInternal(destinationId, sourceId, text, waitForAck, storeSent, SMS_TX_EVENT_SENDING);
+	return smsScheduleQueuedMessageTransmissionInternal(destinationId, sourceId, text, format, waitForAck, storeSent, SMS_TX_EVENT_SENDING);
 }
 
 static void smsProcessPendingOutgoingStart(void)
@@ -2911,6 +2998,10 @@ static void smsProcessPendingOutgoingStart(void)
 
 	if (HRC6000StartQueuedSMS())
 	{
+#if SMS_DEBUG_USB_SERIAL
+		USB_DEBUG_printf("SMS TX started (keyed up)\r\n");
+#endif
+
 		if (outgoingStartTracking.storeSent)
 		{
 			(void)smsStoreSentMessage(outgoingStartTracking.destinationId, outgoingStartTracking.text);
@@ -2919,6 +3010,7 @@ static void smsProcessPendingOutgoingStart(void)
 		smsStartOutgoingTracking(outgoingStartTracking.destinationId,
 			outgoingStartTracking.sourceId,
 			outgoingStartTracking.text,
+			outgoingStartTracking.format,
 			outgoingStartTracking.waitForAck,
 			outgoingStartTracking.startEvent);
 		smsResetOutgoingStartTracking();
@@ -2927,6 +3019,11 @@ static void smsProcessPendingOutgoingStart(void)
 
 	if (ticksTimerHasExpired(&outgoingStartTracking.startTimer))
 	{
+#if SMS_DEBUG_USB_SERIAL
+		USB_DEBUG_printf("SMS TX start timed out: mode=%d slotState=%d txEnabled=%d txActive=%d\r\n",
+			(int)trxGetMode(), (int)slotState, (int)trxTransmissionEnabled, (int)trxIsTransmitting);
+#endif
+
 		smsClearQueuedMessage();
 		smsResetOutgoingStartTracking();
 		smsSetPendingTxEvent(SMS_TX_EVENT_REJECTED);
@@ -2986,7 +3083,7 @@ bool smsRetryLastOutgoingMessage(void)
 		return false;
 	}
 
-	result = smsQueueMessage(outgoingTracking.destinationId, outgoingTracking.sourceId, outgoingTracking.text);
+	result = smsQueueMessage(outgoingTracking.destinationId, outgoingTracking.sourceId, outgoingTracking.text, outgoingTracking.format);
 	if (result != SMS_PACK_OK)
 	{
 		return false;
@@ -2995,6 +3092,7 @@ bool smsRetryLastOutgoingMessage(void)
 	return smsScheduleQueuedMessageTransmissionInternal(outgoingTracking.destinationId,
 		outgoingTracking.sourceId,
 		outgoingTracking.text,
+		outgoingTracking.format,
 		true,
 		false,
 		SMS_TX_EVENT_RETRYING);
@@ -3472,7 +3570,11 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame, uint8_t 
 			pad = 0U;
 		}
 
-		if (((sapType != 0x40U) && !isDefinedShortOrRaw) || (blocks == 0U) || (blocks > SMS_MAX_RX_DATA_BLOCKS) || (pad >= SMS_BLOCK_DATA_BYTES))
+		// Per ETSI TS 102 361-1 9.2.12, a Defined (Short/Raw) Data header's SAP identifier is
+		// 0b1010 (0xA0 in this nibble position) -- distinct from the 0x40 (IP packet data) SAP
+		// this firmware's own Confirmed/Unconfirmed Data headers use.
+		if ((isDefinedShortOrRaw ? (sapType != 0xA0U) : (sapType != 0x40U)) ||
+			(blocks == 0U) || (blocks > SMS_MAX_RX_DATA_BLOCKS) || (pad >= SMS_BLOCK_DATA_BYTES))
 		{
 			smsResetRxAssembly();
 			return false;
@@ -3884,7 +3986,10 @@ smsPackResult_t smsQueueSentMessage(uint8_t index, uint32_t sourceId)
 		return SMS_PACK_ERROR_INVALID_INDEX;
 	}
 
-	return smsQueueMessage(message.destinationId, sourceId, message.text);
+	// Sent-message storage doesn't record which format the original send used, so resend
+	// always uses the Motorola-format encoder (this firmware's default), matching the format
+	// this same message would have originally been queued with prior to per-send format choice.
+	return smsQueueMessage(message.destinationId, sourceId, message.text, SMS_ENCODER_MOTOROLA);
 }
 
 bool smsHasRxNotification(void)

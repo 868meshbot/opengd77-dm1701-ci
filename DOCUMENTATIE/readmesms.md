@@ -73,3 +73,12 @@ herkennen van Defined Short/Raw Data headers, en het correct decoderen van
 platte UTF-16BE tekst zonder IP/UDP-header. Bevat ook hoe de tijdelijke
 USB-seriële debug-dump (`SMS_DEBUG_USB_SERIAL`, standaard uit) weer aan te
 zetten is voor toekomstig onderzoek.
+
+## Latere toevoeging: verzend-formaat keuze (V3_TEST)
+
+Zie [`sms_send_format_choice.md`](sms_send_format_choice.md) voor het nieuwe
+"Send as" keuzemenu (Motorola / DMR_Standard) in het compose-scherm, de
+strengere SAP-validatie voor Defined Short/Raw Data headers, en een
+gedocumenteerde beperking: een echte Anytone-compatibele (Defined Short
+Data) *encoder* is momenteel niet mogelijk omdat de TX-hardwarepad alleen
+rate-1/2 blocks ondersteunt.
