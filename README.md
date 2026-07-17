@@ -165,6 +165,14 @@ After the post-build step, a cleaned firmware file is also produced via `tools/c
 - `OpenMDUV380_10W_PLUS.bin`
 - `OpenMDUV380_10W_PLUS_Japanese.bin`
 
+## CI
+
+This repo previously carried a GitHub Actions CI setup (headless build +
+release publishing). That was scrubbed: builds are done headlessly with the
+real STM32CubeIDE compiler locally (see "Headless Build" above), so a
+separate CI pipeline wasn't providing anything CI's plain-GCC package could
+actually reproduce.
+
 ## Notes
 
 - This repo contains older documentation in `DOCUMENTATIE/BUILD.md`, but that describes a different toolchain and is not authoritative for this STM32CubeIDE workspace.
