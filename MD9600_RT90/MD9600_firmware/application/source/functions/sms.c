@@ -34,12 +34,22 @@
 #include "hardware/HR-C6000.h"
 #include "hardware/EEPROM.h"
 
+// Dumps SMS TX/RX payload bytes and decode results over the USB CDC debug serial port
+// (USB_DEBUG_printf). Off by default -- flip to 1 to bring it back for wire-format debugging
+// (used to diagnose the network-relayed SMS decode issues; see DOCUMENTATIE/sms_decode_fixes.md).
+#define SMS_DEBUG_USB_SERIAL 0
+#if SMS_DEBUG_USB_SERIAL
+#include "usb/usb_com.h"
+#endif
+
 #define SMS_STORAGE_ADDRESS                    0x0F0000
 #define SMS_STORAGE_MAGIC                      0x534D5349U
 #define SMS_STORAGE_VERSION                    5U
 #define SMS_LEGACY_TEXT_LENGTH                 64U
 #define SMS_STORAGE_DEBOUNCE_MS                1500U
+#define SMS_TX_START_TIMEOUT_MS                4000U
 #define SMS_TX_ACK_TIMEOUT_MS                  6000U
+#define SMS_ACK_RESPONSE_DELAY_MS              1500U
 #define SMS_MOTOROLA_UDP_PORT                0x0FA7U
 #define SMS_MOTOROLA_IPV4_PROTOCOL           0x11U
 #define SMS_MOTOROLA_IPV4_TTL                0x01U
@@ -47,7 +57,9 @@
 #define SMS_MOTOROLA_INTERNAL_HEADER_SIZE      10U
 #define SMS_STANDARD_TEXT_OFFSET               32U
 #define SMS_STANDARD_UDP_PORT                0x1398U
-#define SMS_RX_MAX_PAYLOAD_BYTES      (SMS_MAX_RX_DATA_BLOCKS * SMS_BLOCK_DATA_BYTES)
+// Sized for the larger rate-3/4 block payload (16 bytes/block, see SMS_RATE34_DATA_LENGTH in
+// HR-C6000.h), not the rate-1/2 SMS_BLOCK_DATA_BYTES (12) this firmware's own TX encoding uses.
+#define SMS_RX_MAX_PAYLOAD_BYTES      (SMS_MAX_RX_DATA_BLOCKS * 16U)
 #define SMS_RX_MIN_UTF16_LE_RUN_CHARS           6U
 #define SMS_WINDOW_NEIGHBORHOOD_RADIUS         12U
 #define SMS_WINDOW_NEIGHBORHOOD_STEP            2U
@@ -138,6 +150,7 @@ typedef struct
 	bool responseRequested;
 	uint8_t ackProfile;
 	uint32_t sourceId;
+	bool alwaysAck;
 } smsRxAssembly_t;
 
 typedef struct
@@ -148,6 +161,7 @@ typedef struct
 	bool responseRequested;
 	uint8_t ackProfile;
 	uint32_t sourceId;
+	bool alwaysAck;
 } smsRxDecodePending_t;
 
 typedef struct
@@ -155,16 +169,32 @@ typedef struct
 	bool active;
 	uint32_t destinationId;
 	uint8_t ackProfile;
+	ticksTimer_t delayTimer;
 } smsAckResponseTracking_t;
 
 typedef struct
 {
 	bool active;
+	bool waitForAck;
 	uint32_t destinationId;
 	uint32_t sourceId;
 	ticksTimer_t ackTimer;
 	char text[SMS_MAX_TEXT_LENGTH + 1U];
+	smsEncoderFormat_t format;
 } smsOutgoingTracking_t;
+
+typedef struct
+{
+	bool active;
+	bool waitForAck;
+	bool storeSent;
+	uint32_t destinationId;
+	uint32_t sourceId;
+	smsTxEvent_t startEvent;
+	ticksTimer_t startTimer;
+	char text[SMS_MAX_TEXT_LENGTH + 1U];
+	smsEncoderFormat_t format;
+} smsOutgoingStartTracking_t;
 
 static uint8_t inboxCount = 0U;
 static uint16_t smsIpSequenceNumber = 0U;
@@ -184,18 +214,27 @@ static smsRxAssembly_t rxAssembly = { 0 };
 static volatile smsRxDecodePending_t rxDecodePending = { 0 };
 static smsAckResponseTracking_t ackResponseTracking = { 0 };
 static smsOutgoingTracking_t outgoingTracking = { 0 };
+static smsOutgoingStartTracking_t outgoingStartTracking = { 0 };
 static smsTxEvent_t pendingTxEvent = SMS_TX_EVENT_NONE;
 static volatile bool smsStorageDirty = false;
 static uint32_t smsStorageDirtySinceTick = 0U;
 
+#if SMS_DEBUG_USB_SERIAL
+static void smsDebugPrintHex(const char *label, const uint8_t *data, uint16_t length);
+#endif
 static void smsResetRxAssembly(void);
 static void smsScheduleAckResponse(uint32_t destinationId, uint8_t ackProfile);
 static bool smsQueueAckResponseMessage(uint32_t destinationId, uint32_t sourceId, uint8_t ackProfile);
 static uint16_t smsCrc16Ccitt(const uint8_t *data, uint8_t length);
 static void smsResetOutgoingTracking(void);
+static void smsResetOutgoingStartTracking(void);
+static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, smsTxEvent_t startEvent);
+static bool smsScheduleQueuedMessageTransmissionInternal(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, bool storeSent, smsTxEvent_t startEvent);
+static void smsProcessPendingOutgoingStart(void);
 static void smsSetPendingTxEvent(smsTxEvent_t event);
 static smsPackResult_t smsConvertTextToUtf16LeUpper(const char *text, uint8_t *payload, uint16_t *payloadLength);
 static smsPackResult_t smsBuildMotorolaPayload(uint32_t destinationId, uint32_t sourceId, const char *text, uint8_t *payload, uint16_t *payloadLength, uint8_t *padOctetCount);
+static smsPackResult_t smsBuildStandardPayload(uint32_t destinationId, uint32_t sourceId, const char *text, uint8_t *payload, uint16_t *payloadLength, uint8_t *padOctetCount);
 static bool smsDecodeMotorolaPayload(const uint8_t *payload, uint16_t totalLength, uint8_t padOctets, char *textOut);
 static bool smsDecodeStandardPayload(const uint8_t *payload, uint16_t totalLength, uint8_t padOctets, char *textOut);
 static bool smsDecodeUtf8Payload(const uint8_t *payload, uint16_t payloadLength, char *textOut);
@@ -225,6 +264,34 @@ static bool smsShouldAckUndecodedPayload(const uint8_t *payload, uint16_t totalL
 static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLength, uint8_t padOctets, uint32_t sourceId);
 static void smsProcessPendingRxDecode(void);
 
+#if SMS_DEBUG_USB_SERIAL
+static void smsDebugPrintHex(const char *label, const uint8_t *data, uint16_t length)
+{
+	static const char hexDigits[] = "0123456789ABCDEF";
+	char hex[257];
+	uint16_t dumpLength = length;
+
+	if (data == NULL)
+	{
+		return;
+	}
+
+	if (dumpLength > 128U)
+	{
+		dumpLength = 128U;
+	}
+
+	for (uint16_t i = 0U; i < dumpLength; i++)
+	{
+		hex[(i * 2U)] = hexDigits[(data[i] >> 4) & 0x0FU];
+		hex[(i * 2U) + 1U] = hexDigits[data[i] & 0x0FU];
+	}
+	hex[dumpLength * 2U] = 0;
+
+	USB_DEBUG_printf("%s len=%u: %s%s\r\n", label, length, hex, ((length > dumpLength) ? "..." : ""));
+}
+#endif
+
 void smsInit(void)
 {
 	memset(&queuedMessage, 0, sizeof(queuedMessage));
@@ -236,7 +303,9 @@ void smsInit(void)
 	smsResetRxAssembly();
 	memset(smsRxDecodePendingPayloadBuffer, 0, sizeof(smsRxDecodePendingPayloadBuffer));
 	memset((void *)&rxDecodePending, 0, sizeof(rxDecodePending));
+	memset(&ackResponseTracking, 0, sizeof(ackResponseTracking));
 	smsResetOutgoingTracking();
+	smsResetOutgoingStartTracking();
 	pendingTxEvent = SMS_TX_EVENT_NONE;
 	smsStorageDirty = false;
 	smsStorageDirtySinceTick = 0U;
@@ -246,6 +315,11 @@ void smsInit(void)
 static void smsResetOutgoingTracking(void)
 {
 	memset(&outgoingTracking, 0, sizeof(outgoingTracking));
+}
+
+static void smsResetOutgoingStartTracking(void)
+{
+	memset(&outgoingStartTracking, 0, sizeof(outgoingStartTracking));
 }
 
 static void smsSetPendingTxEvent(smsTxEvent_t event)
@@ -751,7 +825,7 @@ static bool smsIsPrintableCharacter(uint8_t c)
 	return (((c >= 0x20U) && (c <= 0x7EU)) || (c == '\r') || (c == '\n'));
 }
 
-static bool smsMapUnicodeToDisplay(uint8_t high, uint8_t low, uint8_t *mapped, bool *utf16Like)
+static bool __attribute__((unused)) smsMapUnicodeToDisplay(uint8_t high, uint8_t low, uint8_t *mapped, bool *utf16Like)
 {
 	uint16_t codepoint;
 
@@ -959,77 +1033,42 @@ static void smsStoreSentMessageInternal(uint32_t destinationId, const char *text
 
 static bool smsDecodeUtf16Payload(const uint8_t *payload, uint16_t payloadLength, char *textOut)
 {
-	uint16_t probeIndex = 0U;
-	uint16_t inIndex = 0U;
 	uint16_t outIndex = 0U;
-	uint16_t utf16PatternCount = 0U;
 	uint16_t replacedCount = 0U;
-	uint16_t littleEndianPatternCount = 0U;
-	uint16_t bigEndianPatternCount = 0U;
-	bool preferLittleEndian = true;
+	uint16_t printableCount = 0U;
 
 	if ((payload == NULL) || (textOut == NULL) || ((payloadLength & 0x01U) != 0U))
 	{
 		return false;
 	}
 
-	for (probeIndex = 0U; (probeIndex + 1U) < payloadLength; probeIndex += 2U)
+	for (uint16_t inIndex = 0U; (inIndex + 1U) < payloadLength; inIndex = (uint16_t)(inIndex + 2U))
 	{
-		uint8_t highProbe = payload[probeIndex];
-		uint8_t lowProbe = payload[probeIndex + 1U];
+		uint8_t low = payload[inIndex];
+		uint8_t high = payload[inIndex + 1U];
+		uint16_t codepoint = (uint16_t)(((uint16_t)high << 8) | low);
+		char c = '?';
 
-		if ((highProbe == 0x00U) && smsIsPrintableCharacter(lowProbe))
-		{
-			bigEndianPatternCount++;
-		}
-		else if ((lowProbe == 0x00U) && smsIsPrintableCharacter(highProbe))
-		{
-			littleEndianPatternCount++;
-		}
-	}
-
-	preferLittleEndian = (littleEndianPatternCount >= bigEndianPatternCount);
-
-	while ((inIndex + 1U) < payloadLength)
-	{
-		uint8_t high = payload[inIndex++];
-		uint8_t low = payload[inIndex++];
-		uint8_t c = '?';
-		bool utf16Like = false;
-
-		if ((high == 0x00U) && (low == 0x00U))
+		if (codepoint == 0x0000U)
 		{
 			break;
 		}
 
-		if (smsMapUnicodeToDisplay(high, low, &c, &utf16Like))
+		if ((codepoint >= 0x20U) && (codepoint <= 0x7EU))
 		{
-			if (utf16Like)
-			{
-				utf16PatternCount++;
-			}
+			c = (char)codepoint;
 		}
-		else if (smsIsPrintableCharacter(high) || smsIsPrintableCharacter(low))
+		else if (codepoint == 0x0009U)
 		{
-			if (smsIsPrintableCharacter(high) && smsIsPrintableCharacter(low))
-			{
-				c = (preferLittleEndian ? high : low);
-			}
-			else if (smsIsPrintableCharacter(high))
-			{
-				c = high;
-			}
-			else
-			{
-				c = low;
-			}
-
-			utf16PatternCount++;
+			c = ' ';
+		}
+		else if ((codepoint == 0x000AU) || (codepoint == 0x000DU))
+		{
+			c = '\n';
 		}
 		else
 		{
-			c = '?';
-			replacedCount++;
+			c = smsMapUnicodeToAscii(codepoint);
 		}
 
 		if (outIndex >= SMS_MAX_TEXT_LENGTH)
@@ -1037,14 +1076,13 @@ static bool smsDecodeUtf16Payload(const uint8_t *payload, uint16_t payloadLength
 			break;
 		}
 
-		if (c == '\t')
+		if (c == '?')
 		{
-			c = ' ';
+			replacedCount++;
 		}
-
-		if (c == '\r')
+		else
 		{
-			c = '\n';
+			printableCount++;
 		}
 
 		if ((c == '\n') && (outIndex > 0U) && (textOut[outIndex - 1U] == '\n'))
@@ -1052,22 +1090,102 @@ static bool smsDecodeUtf16Payload(const uint8_t *payload, uint16_t payloadLength
 			continue;
 		}
 
-		textOut[outIndex++] = (char)c;
+		textOut[outIndex++] = c;
 	}
 
 	textOut[outIndex] = 0;
 
-	if ((outIndex == 0U) || (utf16PatternCount < 2U))
+	if ((outIndex == 0U) || (printableCount == 0U))
 	{
 		return false;
 	}
 
-	if ((outIndex <= 2U) && (replacedCount != 0U))
+	// Reject random binary that accidentally contains a small UTF-16LE-like run.
+	if ((replacedCount * 3U) > outIndex)
 	{
 		return false;
 	}
 
-	// Reject random binary that accidentally contains a single UTF-16-like pair.
+	return true;
+}
+
+// Whole-buffer UTF-16BE decode, mirroring smsDecodeUtf16Payload() above (which is LE, matching
+// this firmware's own outbound encoding) but for the big-endian, unwrapped plain-text format
+// used by real network-relayed Defined Short Data messages: no IP/UDP header, no offset search,
+// just two-byte-per-character text starting at byte 0. Unlike smsDecodeUtf16BeRun() (a "longest
+// printable run" scanner that stops at the first embedded newline), this walks the whole buffer
+// the same way the LE decoder does, so a multi-line message decodes in one clean pass instead of
+// being reassembled from multiple offset-scanned fragments via smsMergeDecodedCandidate().
+static bool smsDecodeUtf16BePayload(const uint8_t *payload, uint16_t payloadLength, char *textOut)
+{
+	uint16_t outIndex = 0U;
+	uint16_t replacedCount = 0U;
+	uint16_t printableCount = 0U;
+
+	if ((payload == NULL) || (textOut == NULL) || ((payloadLength & 0x01U) != 0U))
+	{
+		return false;
+	}
+
+	for (uint16_t inIndex = 0U; (inIndex + 1U) < payloadLength; inIndex = (uint16_t)(inIndex + 2U))
+	{
+		uint8_t high = payload[inIndex];
+		uint8_t low = payload[inIndex + 1U];
+		uint16_t codepoint = (uint16_t)(((uint16_t)high << 8) | low);
+		char c = '?';
+
+		if (codepoint == 0x0000U)
+		{
+			break;
+		}
+
+		if ((codepoint >= 0x20U) && (codepoint <= 0x7EU))
+		{
+			c = (char)codepoint;
+		}
+		else if (codepoint == 0x0009U)
+		{
+			c = ' ';
+		}
+		else if ((codepoint == 0x000AU) || (codepoint == 0x000DU))
+		{
+			c = '\n';
+		}
+		else
+		{
+			c = smsMapUnicodeToAscii(codepoint);
+		}
+
+		if (outIndex >= SMS_MAX_TEXT_LENGTH)
+		{
+			break;
+		}
+
+		if (c == '?')
+		{
+			replacedCount++;
+		}
+		else
+		{
+			printableCount++;
+		}
+
+		if ((c == '\n') && (outIndex > 0U) && (textOut[outIndex - 1U] == '\n'))
+		{
+			continue;
+		}
+
+		textOut[outIndex++] = c;
+	}
+
+	textOut[outIndex] = 0;
+
+	if ((outIndex == 0U) || (printableCount == 0U))
+	{
+		return false;
+	}
+
+	// Reject random binary that accidentally contains a small UTF-16BE-like run.
 	if ((replacedCount * 3U) > outIndex)
 	{
 		return false;
@@ -1142,6 +1260,29 @@ static uint16_t smsCountCharOccurrence(const char *text, char value)
 	}
 
 	return count;
+}
+
+// Decides whether it's worth trying another, more aggressive decode strategy (offset-scanning,
+// windowed neighborhood search) on top of what's already been decoded. A handful of unmappable
+// characters (e.g. a degree sign) in an otherwise long, clean decode is not "poor quality" --
+// treating it as such lets a later stage's candidate get spliced into this one character-by-
+// character via smsMergeDecodedCandidate(), which can overwrite/drop correctly-decoded text with
+// fragments from a completely different (wrong) alignment. Only keep looking when a significant
+// fraction of the text is actually unrecognised.
+static bool smsDecodedTextIsPoor(const char *decodedText)
+{
+	uint16_t length;
+	uint16_t questionCount;
+
+	if ((decodedText == NULL) || (decodedText[0] == 0))
+	{
+		return true;
+	}
+
+	length = (uint16_t)strlen(decodedText);
+	questionCount = smsCountCharOccurrence(decodedText, '?');
+
+	return ((questionCount * 5U) > length);
 }
 
 static int32_t smsScoreDecodedText(const char *text)
@@ -1339,7 +1480,24 @@ static bool smsTryAdoptDecodedCandidate(char *decodedText, const char *candidate
 		return false;
 	}
 
-	if ((decodedText[0] == 0) || smsIsBetterDecodedCandidate(decodedText, candidateText))
+	if (decodedText[0] == 0)
+	{
+		// Nothing decoded yet is not a licence to adopt just anything: a permissive decode
+		// attempt (e.g. ASCII, which accepts any printable byte) can produce a short spurious
+		// match against header/framing noise. Hold the first candidate to the same quality bar
+		// (smsScoreDecodedText() rejects anything under 3 characters as garbage) as every
+		// subsequent comparison already uses.
+		if (smsScoreDecodedText(candidateText) <= -32768)
+		{
+			return false;
+		}
+
+		strncpy(decodedText, candidateText, SMS_MAX_TEXT_LENGTH);
+		decodedText[SMS_MAX_TEXT_LENGTH] = 0;
+		return true;
+	}
+
+	if (smsIsBetterDecodedCandidate(decodedText, candidateText))
 	{
 		strncpy(decodedText, candidateText, SMS_MAX_TEXT_LENGTH);
 		decodedText[SMS_MAX_TEXT_LENGTH] = 0;
@@ -1372,12 +1530,10 @@ static bool smsTryDecodeWindowDirect(const uint8_t *payload, uint16_t payloadLen
 		improved |= smsTryAdoptDecodedCandidate(decodedText, scratchText);
 	}
 
-	if ((boundedLength >= 3U) && smsDecodeUtf8Payload(payload, boundedLength, scratchText))
-	{
-		improved |= smsTryAdoptDecodedCandidate(decodedText, scratchText);
-	}
-
-	if (allowAscii && (boundedLength >= 1U) && smsDecodeAsciiPayload(payload, boundedLength, scratchText))
+	// Some senders (e.g. Defined Short Data messages relayed from a network gateway) carry
+	// plain 8-bit text with no IP/UDP wrapper at all, so there's no UTF-16 to find here. Try
+	// that too when the caller has indicated this window is a plausible text window.
+	if (allowAscii && smsDecodeAsciiPayload(payload, payloadLength, scratchText))
 	{
 		improved |= smsTryAdoptDecodedCandidate(decodedText, scratchText);
 	}
@@ -1514,7 +1670,7 @@ static char smsMapUnicodeToAscii(uint32_t codePoint)
 	}
 }
 
-static bool smsDecodeUtf8Payload(const uint8_t *payload, uint16_t payloadLength, char *textOut)
+static bool __attribute__((unused)) smsDecodeUtf8Payload(const uint8_t *payload, uint16_t payloadLength, char *textOut)
 {
 	uint16_t outIndex = 0U;
 	uint16_t printableCount = 0U;
@@ -1726,7 +1882,7 @@ static bool smsDecodeUtf16LeRun(const uint8_t *payload, uint16_t payloadLength, 
 	return true;
 }
 
-static bool smsDecodeUtf16BeRun(const uint8_t *payload, uint16_t payloadLength, char *textOut, uint16_t *offsetOut)
+static bool __attribute__((unused)) smsDecodeUtf16BeRun(const uint8_t *payload, uint16_t payloadLength, char *textOut, uint16_t *offsetOut)
 {
 	uint16_t bestOffset = 0U;
 	uint16_t bestLength = 0U;
@@ -1871,7 +2027,7 @@ static bool smsDecodeUtf16PayloadByScan(const uint8_t *payload, uint16_t payload
 	return true;
 }
 
-static bool smsDecodeUtf8PayloadByScan(const uint8_t *payload, uint16_t payloadLength, char *textOut, uint16_t *offsetOut)
+static bool __attribute__((unused)) smsDecodeUtf8PayloadByScan(const uint8_t *payload, uint16_t payloadLength, char *textOut, uint16_t *offsetOut)
 {
 	char candidate[SMS_MAX_TEXT_LENGTH + 1U];
 	int32_t bestScore = -32768;
@@ -1952,6 +2108,7 @@ static void smsScheduleAckResponse(uint32_t destinationId, uint8_t ackProfile)
 
 	ackResponseTracking.destinationId = destinationId;
 	ackResponseTracking.ackProfile = ((ackProfile == SMS_ACK_PROFILE_MODERN) ? SMS_ACK_PROFILE_MODERN : SMS_ACK_PROFILE_LEGACY);
+	ticksTimerStart(&ackResponseTracking.delayTimer, SMS_ACK_RESPONSE_DELAY_MS);
 	ackResponseTracking.active = true;
 }
 
@@ -2021,7 +2178,7 @@ static bool smsHandleIncomingResponsePdu(const uint8_t *frame)
 	uint32_t destinationId;
 	uint32_t sourceId;
 
-	if ((frame == NULL) || (!outgoingTracking.active))
+	if ((frame == NULL) || (!outgoingTracking.active) || (!outgoingTracking.waitForAck))
 	{
 		return false;
 	}
@@ -2255,6 +2412,78 @@ static smsPackResult_t smsBuildMotorolaPayload(uint32_t destinationId, uint32_t 
 	smsBuildIpHeader(payload, ipPacketLength, sourceId, destinationId);
 	smsBuildMotorolaUdpHeader(payload, textByteLength, currentIpSeq);
 	memcpy(&payload[SMS_MOTOROLA_TEXT_OFFSET], utf16Payload, textByteLength);
+
+	crc32 = smsCrc32Compute(payload, crcOffset);
+	payload[crcOffset] = (uint8_t)(crc32 & 0xFFU);
+	payload[crcOffset + 1U] = (uint8_t)((crc32 >> 8) & 0xFFU);
+	payload[crcOffset + 2U] = (uint8_t)((crc32 >> 16) & 0xFFU);
+	payload[crcOffset + 3U] = (uint8_t)((crc32 >> 24) & 0xFFU);
+
+	return SMS_PACK_OK;
+}
+
+// DMR_Standard Compatible Format: same IP header as Motorola, UDP port SMS_STANDARD_UDP_PORT, and
+// a much shorter 4-byte internal sub-header (vs Motorola's 10 bytes) before the text -- this is
+// the format Anytone radios identify as "DMR_Standard" in their own menus. Byte layout mirrors
+// smsDecodeStandardPayload()'s expectations exactly (that decoder already works against real
+// captures, so this builder matches it byte-for-byte rather than re-deriving from the spec PDF).
+static void smsBuildStandardUdpHeader(uint8_t *packet, uint16_t textByteLength)
+{
+	uint16_t udpLength = (uint16_t)(textByteLength + 12U);
+	uint16_t checksum;
+
+	packet[20] = (uint8_t)((SMS_STANDARD_UDP_PORT >> 8) & 0xFFU);
+	packet[21] = (uint8_t)(SMS_STANDARD_UDP_PORT & 0xFFU);
+	packet[22] = (uint8_t)((SMS_STANDARD_UDP_PORT >> 8) & 0xFFU);
+	packet[23] = (uint8_t)(SMS_STANDARD_UDP_PORT & 0xFFU);
+	packet[24] = (uint8_t)((udpLength >> 8) & 0xFFU);
+	packet[25] = (uint8_t)(udpLength & 0xFFU);
+	packet[26] = 0x00U;
+	packet[27] = 0x00U;
+	packet[28] = 0x00U;
+	packet[29] = 0x0DU;
+	packet[30] = 0x00U;
+	packet[31] = 0x0AU;
+
+	checksum = smsUdpChecksum(packet, udpLength);
+	packet[26] = (uint8_t)((checksum >> 8) & 0xFFU);
+	packet[27] = (uint8_t)(checksum & 0xFFU);
+}
+
+static smsPackResult_t smsBuildStandardPayload(uint32_t destinationId, uint32_t sourceId, const char *text, uint8_t *payload, uint16_t *payloadLength, uint8_t *padOctetCount)
+{
+	uint8_t utf16Payload[SMS_MAX_UTF16_PAYLOAD_BYTES];
+	uint16_t textByteLength = 0U;
+	uint16_t ipPacketLength;
+	uint16_t crcOffset;
+	uint32_t crc32;
+	smsPackResult_t result;
+
+	if ((payload == NULL) || (payloadLength == NULL) || (padOctetCount == NULL))
+	{
+		return SMS_PACK_ERROR_EMPTY;
+	}
+
+	result = smsConvertTextToUtf16LeUpper(text, utf16Payload, &textByteLength);
+	if (result != SMS_PACK_OK)
+	{
+		return result;
+	}
+
+	ipPacketLength = (uint16_t)(SMS_STANDARD_TEXT_OFFSET + textByteLength);
+	*padOctetCount = (uint8_t)((SMS_BLOCK_DATA_BYTES - ((ipPacketLength + SMS_STANDARD_CRC32_BYTES) % SMS_BLOCK_DATA_BYTES)) % SMS_BLOCK_DATA_BYTES);
+	crcOffset = (uint16_t)(ipPacketLength + *padOctetCount);
+	*payloadLength = (uint16_t)(crcOffset + SMS_STANDARD_CRC32_BYTES);
+
+	if (*payloadLength > SMS_MAX_TRANSPORT_BYTES)
+	{
+		return SMS_PACK_ERROR_TOO_LONG;
+	}
+
+	memset(payload, 0, SMS_MAX_TRANSPORT_BYTES);
+	smsBuildIpHeader(payload, ipPacketLength, sourceId, destinationId);
+	smsBuildStandardUdpHeader(payload, textByteLength);
+	memcpy(&payload[SMS_STANDARD_TEXT_OFFSET], utf16Payload, textByteLength);
 
 	crc32 = smsCrc32Compute(payload, crcOffset);
 	payload[crcOffset] = (uint8_t)(crc32 & 0xFFU);
@@ -2583,7 +2812,7 @@ static smsPackResult_t smsConvertTextToUtf16LeUpper(const char *text, uint8_t *p
 	return ((index == 0U) ? SMS_PACK_ERROR_EMPTY : SMS_PACK_OK);
 }
 
-smsPackResult_t smsPackMessage(uint32_t destinationId, uint32_t sourceId, const char *text, smsPreparedMessage_t *message)
+smsPackResult_t smsPackMessage(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, smsPreparedMessage_t *message)
 {
 	smsPackResult_t result;
 	uint8_t payload[SMS_MAX_DATA_BLOCKS * SMS_BLOCK_DATA_BYTES];
@@ -2612,7 +2841,15 @@ smsPackResult_t smsPackMessage(uint32_t destinationId, uint32_t sourceId, const 
 	message->requestAck = true;
 	memset(payload, 0, sizeof(payload));
 
-	result = smsBuildMotorolaPayload(destinationId, sourceId, text, payload, &payloadLength, &message->padOctetCount);
+	if (format == SMS_ENCODER_STANDARD)
+	{
+		result = smsBuildStandardPayload(destinationId, sourceId, text, payload, &payloadLength, &message->padOctetCount);
+	}
+	else
+	{
+		result = smsBuildMotorolaPayload(destinationId, sourceId, text, payload, &payloadLength, &message->padOctetCount);
+	}
+
 	if (result != SMS_PACK_OK)
 	{
 		return result;
@@ -2641,10 +2878,29 @@ smsPackResult_t smsPackMessage(uint32_t destinationId, uint32_t sourceId, const 
 	return SMS_PACK_OK;
 }
 
-smsPackResult_t smsQueueMessage(uint32_t destinationId, uint32_t sourceId, const char *text)
+smsPackResult_t smsQueueMessage(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format)
 {
-	smsPackResult_t result = smsPackMessage(destinationId, sourceId, text, &queuedMessage);
+	smsPackResult_t result = smsPackMessage(destinationId, sourceId, text, format, &queuedMessage);
 	queuedMessageValid = (result == SMS_PACK_OK);
+
+#if SMS_DEBUG_USB_SERIAL
+	USB_DEBUG_printf("SMS pack to=%lu from=%lu format=%d result=%d text=\"%s\"\r\n", (unsigned long)destinationId, (unsigned long)sourceId, (int)format, (int)result, text);
+
+	if (queuedMessageValid)
+	{
+		uint8_t flatPayload[SMS_MAX_DATA_BLOCKS * SMS_BLOCK_DATA_BYTES];
+		uint16_t flatLength = (uint16_t)(queuedMessage.blockCount * SMS_BLOCK_DATA_BYTES);
+
+		for (uint8_t block = 0U; block < queuedMessage.blockCount; block++)
+		{
+			memcpy(&flatPayload[(uint16_t)block * SMS_BLOCK_DATA_BYTES], queuedMessage.blocks[block], SMS_BLOCK_DATA_BYTES);
+		}
+
+		USB_DEBUG_printf("SMS TX to=%lu from=%lu text=\"%s\"\r\n", (unsigned long)destinationId, (unsigned long)sourceId, text);
+		smsDebugPrintHex("SMS TX payload", flatPayload, flatLength);
+	}
+#endif
+
 	return result;
 }
 
@@ -2664,7 +2920,7 @@ void smsClearQueuedMessage(void)
 	memset(&queuedMessage, 0, sizeof(queuedMessage));
 }
 
-void smsRegisterOutgoingMessage(uint32_t destinationId, uint32_t sourceId, const char *text)
+static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, smsTxEvent_t startEvent)
 {
 	if ((text == NULL) || (text[0] == 0) || (destinationId == 0U) || (sourceId == 0U))
 	{
@@ -2672,17 +2928,111 @@ void smsRegisterOutgoingMessage(uint32_t destinationId, uint32_t sourceId, const
 	}
 
 	outgoingTracking.active = true;
+	outgoingTracking.waitForAck = waitForAck;
 	outgoingTracking.destinationId = destinationId;
 	outgoingTracking.sourceId = sourceId;
+	outgoingTracking.format = format;
 	strncpy(outgoingTracking.text, text, SMS_MAX_TEXT_LENGTH);
 	outgoingTracking.text[SMS_MAX_TEXT_LENGTH] = 0;
-	ticksTimerStart(&outgoingTracking.ackTimer, SMS_TX_ACK_TIMEOUT_MS);
-	smsSetPendingTxEvent(SMS_TX_EVENT_SENDING);
+
+	if (waitForAck)
+	{
+		ticksTimerStart(&outgoingTracking.ackTimer, SMS_TX_ACK_TIMEOUT_MS);
+	}
+	else
+	{
+		ticksTimerReset(&outgoingTracking.ackTimer);
+	}
+
+	smsSetPendingTxEvent(startEvent);
+}
+
+static bool smsScheduleQueuedMessageTransmissionInternal(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, bool storeSent, smsTxEvent_t startEvent)
+{
+	if ((text == NULL) || (text[0] == 0) || (destinationId == 0U) || (sourceId == 0U) || !smsHasQueuedMessage())
+	{
+		return false;
+	}
+
+	if (outgoingTracking.active || outgoingStartTracking.active || HRC6000IsSendingSMS() || HRC6000IRQHandlerIsRunning())
+	{
+		return false;
+	}
+
+	outgoingStartTracking.active = true;
+	outgoingStartTracking.waitForAck = waitForAck;
+	outgoingStartTracking.storeSent = storeSent;
+	outgoingStartTracking.destinationId = destinationId;
+	outgoingStartTracking.sourceId = sourceId;
+	outgoingStartTracking.startEvent = startEvent;
+	outgoingStartTracking.format = format;
+	strncpy(outgoingStartTracking.text, text, SMS_MAX_TEXT_LENGTH);
+	outgoingStartTracking.text[SMS_MAX_TEXT_LENGTH] = 0;
+	ticksTimerStart(&outgoingStartTracking.startTimer, SMS_TX_START_TIMEOUT_MS);
+	return true;
+}
+
+bool smsScheduleQueuedMessageTransmission(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, bool storeSent)
+{
+	return smsScheduleQueuedMessageTransmissionInternal(destinationId, sourceId, text, format, waitForAck, storeSent, SMS_TX_EVENT_SENDING);
+}
+
+static void smsProcessPendingOutgoingStart(void)
+{
+	if (!outgoingStartTracking.active)
+	{
+		return;
+	}
+
+	if (!smsHasQueuedMessage())
+	{
+		smsResetOutgoingStartTracking();
+		smsSetPendingTxEvent(SMS_TX_EVENT_REJECTED);
+		return;
+	}
+
+	if (HRC6000IsSendingSMS() || HRC6000IRQHandlerIsRunning())
+	{
+		return;
+	}
+
+	if (HRC6000StartQueuedSMS())
+	{
+#if SMS_DEBUG_USB_SERIAL
+		USB_DEBUG_printf("SMS TX started (keyed up)\r\n");
+#endif
+
+		if (outgoingStartTracking.storeSent)
+		{
+			(void)smsStoreSentMessage(outgoingStartTracking.destinationId, outgoingStartTracking.text);
+		}
+
+		smsStartOutgoingTracking(outgoingStartTracking.destinationId,
+			outgoingStartTracking.sourceId,
+			outgoingStartTracking.text,
+			outgoingStartTracking.format,
+			outgoingStartTracking.waitForAck,
+			outgoingStartTracking.startEvent);
+		smsResetOutgoingStartTracking();
+		return;
+	}
+
+	if (ticksTimerHasExpired(&outgoingStartTracking.startTimer))
+	{
+#if SMS_DEBUG_USB_SERIAL
+		USB_DEBUG_printf("SMS TX start timed out: mode=%d slotState=%d txEnabled=%d txActive=%d\r\n",
+			(int)trxGetMode(), (int)slotState, (int)trxTransmissionEnabled, (int)trxIsTransmitting);
+#endif
+
+		smsClearQueuedMessage();
+		smsResetOutgoingStartTracking();
+		smsSetPendingTxEvent(SMS_TX_EVENT_REJECTED);
+	}
 }
 
 void smsNotifyOutgoingAckReceived(void)
 {
-	if (!outgoingTracking.active)
+	if (!outgoingTracking.active || !outgoingTracking.waitForAck)
 	{
 		return;
 	}
@@ -2715,7 +3065,7 @@ void smsNotifyOutgoingNoRepeater(void)
 
 void smsNotifyOutgoingSent(void)
 {
-	if (!outgoingTracking.active)
+	if (!outgoingTracking.active || outgoingTracking.waitForAck)
 	{
 		return;
 	}
@@ -2733,22 +3083,19 @@ bool smsRetryLastOutgoingMessage(void)
 		return false;
 	}
 
-	result = smsQueueMessage(outgoingTracking.destinationId, outgoingTracking.sourceId, outgoingTracking.text);
+	result = smsQueueMessage(outgoingTracking.destinationId, outgoingTracking.sourceId, outgoingTracking.text, outgoingTracking.format);
 	if (result != SMS_PACK_OK)
 	{
 		return false;
 	}
 
-	if (HRC6000StartQueuedSMS() == false)
-	{
-		smsClearQueuedMessage();
-		return false;
-	}
-
-	outgoingTracking.active = true;
-	ticksTimerStart(&outgoingTracking.ackTimer, SMS_TX_ACK_TIMEOUT_MS);
-	smsSetPendingTxEvent(SMS_TX_EVENT_SENDING);
-	return true;
+	return smsScheduleQueuedMessageTransmissionInternal(outgoingTracking.destinationId,
+		outgoingTracking.sourceId,
+		outgoingTracking.text,
+		outgoingTracking.format,
+		true,
+		false,
+		SMS_TX_EVENT_RETRYING);
 }
 
 smsTxEvent_t smsConsumeTxEvent(void)
@@ -2771,10 +3118,6 @@ static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLeng
 	uint16_t udpPayloadLength = 0U;
 	uint16_t standardTextOffsetLength = 0U;
 	uint16_t motorolaTextOffsetLength = 0U;
-	uint16_t utf16ScanOffset = 0U;
-	uint16_t utf8ScanOffset = 0U;
-	uint16_t utf16RunOffset = 0U;
-	uint16_t utf16BeRunOffset = 0U;
 	bool hasMotorolaSignature = false;
 	bool hasMotorolaPort = false;
 	bool hasStandardPort = false;
@@ -2786,6 +3129,11 @@ static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLeng
 	{
 		return false;
 	}
+
+#if SMS_DEBUG_USB_SERIAL
+	USB_DEBUG_printf("SMS RX from=%lu totalLength=%u padOctets=%u\r\n", (unsigned long)sourceId, totalLength, padOctets);
+	smsDebugPrintHex("SMS RX payload", payload, totalLength);
+#endif
 
 	for (uint8_t i = 0U; i < SMS_DECODE_BUF_COUNT; i++)
 	{
@@ -2818,7 +3166,11 @@ static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLeng
 	payloadLength = (uint16_t)(totalLength - effectivePadOctets);
 	textDecodeLength = payloadLength;
 
-	if (payloadLength >= 4U)
+	// Only trust byte[2:3] as an IP packet length field when this actually looks like an IPv4
+	// header (version 4, IHL 5, i.e. payload[0] == 0x45) -- otherwise those two bytes can be
+	// anything (e.g. the first two text characters of an unwrapped plain-text message) and
+	// coincidentally fall in-range, wrongly truncating the scan window for the real content.
+	if ((payloadLength >= 4U) && (payload[0] == 0x45U))
 	{
 		ipPacketLength = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
 		if ((ipPacketLength >= 20U) && (ipPacketLength <= payloadLength))
@@ -2905,7 +3257,7 @@ static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLeng
 	}
 
 	// Stage 2: direct decode in likely text windows (no brute-force raw replay).
-	if ((decodedText[0] == 0) || (smsCountCharOccurrence(decodedText, '?') > 0U))
+	if (smsDecodedTextIsPoor(decodedText))
 	{
 		if ((hasMotorolaSignature || hasMotorolaPort) && (motorolaTextOffsetLength > 0U))
 		{
@@ -2960,35 +3312,48 @@ static bool smsDecodeCurrentRxBuffers(const uint8_t *payload, uint16_t totalLeng
 	}
 
 	// Stage 3: expensive full-payload scans only when quality is still poor.
-	if (((decodedText[0] == 0) || (smsCountCharOccurrence(decodedText, '?') > 0U)) &&
-		smsDecodeUtf16LeRun(scanPayload, scanLength, scratchText, &utf16RunOffset) &&
+
+	// Try a clean, direct whole-buffer UTF-16BE read first: real network-relayed Defined Short
+	// Data messages are plain BE text with no framing at all starting at byte 0 (confirmed from
+	// an on-air capture), and a single clean decode here is far less likely to produce a
+	// scrambled result than falling through to the offset-scanning/merge-based fallbacks below.
+	if ((smsDecodedTextIsPoor(decodedText)) &&
+		smsDecodeUtf16BePayload(scanPayload, (uint16_t)(scanLength & 0xFFFEU), scratchText) &&
 		smsTryAdoptDecodedCandidate(decodedText, scratchText))
 	{
 		// Candidate accepted by quality score.
 	}
 
-	if (((decodedText[0] == 0) || (smsCountCharOccurrence(decodedText, '?') > 0U)) &&
-		smsDecodeUtf16BeRun(scanPayload, scanLength, scratchText, &utf16BeRunOffset) &&
+	if ((smsDecodedTextIsPoor(decodedText)) &&
+		smsDecodeUtf16LeRun(scanPayload, scanLength, scratchText, NULL) &&
 		smsTryAdoptDecodedCandidate(decodedText, scratchText))
 	{
 		// Candidate accepted by quality score.
 	}
 
-	if (((decodedText[0] == 0) || (smsCountCharOccurrence(decodedText, '?') > 0U)) &&
-		smsDecodeUtf16PayloadByScan(scanPayload, scanLength, scratchText, &utf16ScanOffset) &&
+	if ((smsDecodedTextIsPoor(decodedText)) &&
+		smsDecodeUtf16PayloadByScan(scanPayload, scanLength, scratchText, NULL) &&
 		smsTryAdoptDecodedCandidate(decodedText, scratchText))
 	{
 		// Candidate accepted by quality score.
 	}
 
-	if (((decodedText[0] == 0) || (smsCountCharOccurrence(decodedText, '?') > 0U)) &&
-		smsDecodeUtf8PayloadByScan(scanPayload, scanLength, scratchText, &utf8ScanOffset) &&
+	// Last resort: plain 8-bit text with no UTF-16 anywhere in it and no recognised
+	// Motorola/DMR_Standard port or signature (so Stage 2 never ran at all) -- e.g. a raw
+	// Defined Short Data message relayed from a network gateway rather than this firmware's
+	// own IP/UDP-wrapped format.
+	if ((smsDecodedTextIsPoor(decodedText)) &&
+		smsDecodeAsciiPayload(scanPayload, scanLength, scratchText) &&
 		smsTryAdoptDecodedCandidate(decodedText, scratchText))
 	{
 		// Candidate accepted by quality score.
 	}
 
 	decoded = (decodedText[0] != 0);
+
+#if SMS_DEBUG_USB_SERIAL
+	USB_DEBUG_printf("SMS RX decode %s: \"%s\"\r\n", (decoded ? "OK" : "FAILED"), (decoded ? decodedText : ""));
+#endif
 
 	if (decoded)
 	{
@@ -3018,7 +3383,11 @@ static bool smsShouldAckUndecodedPayload(const uint8_t *payload, uint16_t totalL
 	payloadLength = (uint16_t)(totalLength - effectivePadOctets);
 	textDecodeLength = payloadLength;
 
-	if (payloadLength >= 4U)
+	// Only trust byte[2:3] as an IP packet length field when this actually looks like an IPv4
+	// header (version 4, IHL 5, i.e. payload[0] == 0x45) -- otherwise those two bytes can be
+	// anything (e.g. the first two text characters of an unwrapped plain-text message) and
+	// coincidentally fall in-range, wrongly truncating the scan window for the real content.
+	if ((payloadLength >= 4U) && (payload[0] == 0x45U))
 	{
 		ipPacketLength = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
 		if ((ipPacketLength >= 20U) && (ipPacketLength <= payloadLength))
@@ -3078,7 +3447,7 @@ static void smsProcessPendingRxDecode(void)
 		rxDecodePending.sourceId);
 
 	if (rxDecodePending.responseRequested && (rxDecodePending.sourceId != 0U) &&
-		(decoded || smsShouldAckUndecodedPayload(smsRxDecodePendingPayloadBuffer,
+		(decoded || rxDecodePending.alwaysAck || smsShouldAckUndecodedPayload(smsRxDecodePendingPayloadBuffer,
 			rxDecodePending.totalLength,
 			rxDecodePending.padOctets)))
 	{
@@ -3091,10 +3460,13 @@ static void smsProcessPendingRxDecode(void)
 void smsTick(void)
 {
 	smsProcessPendingRxDecode();
+	smsProcessPendingOutgoingStart();
 
 	if (ackResponseTracking.active &&
 		(trxDMRID != 0U) &&
+		ticksTimerHasExpired(&ackResponseTracking.delayTimer) &&
 		(slotState == DMR_STATE_IDLE) &&
+		!outgoingStartTracking.active &&
 		!smsHasQueuedMessage() &&
 		!HRC6000IsSendingSMS() &&
 		!HRC6000IRQHandlerIsRunning())
@@ -3112,7 +3484,7 @@ void smsTick(void)
 		}
 	}
 
-	if (!outgoingTracking.active)
+	if (!outgoingTracking.active || !outgoingTracking.waitForAck)
 	{
 		return;
 	}
@@ -3131,7 +3503,7 @@ void smsTick(void)
 	smsSetPendingTxEvent(SMS_TX_EVENT_TIMEOUT);
 }
 
-bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
+bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame, uint8_t frameLength)
 {
 	if (frame == NULL)
 	{
@@ -3141,8 +3513,15 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 	if (dataType == 0x06U)
 	{
 		uint8_t dataPacketFormat = (uint8_t)(frame[0] & 0x0FU);
+		// Real-world network SMS gateways (BrandMeister/MOTOTRBO-style) deliver text via the
+		// Defined Short Data / Raw Short Data DPF, not the Confirmed/Unconfirmed Data DPF this
+		// firmware uses for its own radio-to-radio sends. That header lays out the "blocks to
+		// follow" field differently (top of byte 0 + bottom of byte 1, per ETSI TS 102 361-2 /
+		// MMDVMHost's DMRDataHeader.cpp DPF_DEFINED_SHORT case) and repurposes byte 1's upper
+		// nibble, so it can't be validated against the SAP/pad layout used for the other DPFs.
+		bool isDefinedShortOrRaw = ((dataPacketFormat == 0x0DU) || (dataPacketFormat == 0x0EU));
 		// Some systems request response via bit6, others by dataPacketFormat 0x02/0x03.
-		bool responseRequestedExplicit = (((frame[0] & 0x40U) != 0U) || (dataPacketFormat == 0x02U) || (dataPacketFormat == 0x03U));
+		bool responseRequestedExplicit = (((frame[0] & 0x40U) != 0U) || (dataPacketFormat == 0x02U) || (dataPacketFormat == 0x03U) || isDefinedShortOrRaw);
 		bool responseRequested = responseRequestedExplicit;
 		uint8_t ackProfile = SMS_ACK_PROFILE_MODERN;
 		uint8_t sapType;
@@ -3156,8 +3535,18 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 		}
 
 		sapType = (uint8_t)(frame[1] & 0xF0U);
-		blocks = (uint8_t)(frame[8] & 0x7FU);
-		pad = (uint8_t)((frame[0] & 0x10U) | (frame[1] & 0x0FU));
+
+		if (isDefinedShortOrRaw)
+		{
+			blocks = (uint8_t)((frame[0] & 0x30U) + (frame[1] & 0x0FU));
+			pad = 0U;
+		}
+		else
+		{
+			blocks = (uint8_t)(frame[8] & 0x7FU);
+			pad = (uint8_t)((frame[0] & 0x10U) | (frame[1] & 0x0FU));
+		}
+
 		sourceId = (((uint32_t)frame[5] << 16) | ((uint32_t)frame[6] << 8) | frame[7]);
 
 		// Legacy/original firmwares can send valid inbound SMS headers as format 0x01
@@ -3181,7 +3570,11 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 			pad = 0U;
 		}
 
-		if ((sapType != 0x40U) || (blocks == 0U) || (blocks > SMS_MAX_RX_DATA_BLOCKS) || (pad >= SMS_BLOCK_DATA_BYTES))
+		// Per ETSI TS 102 361-1 9.2.12, a Defined (Short/Raw) Data header's SAP identifier is
+		// 0b1010 (0xA0 in this nibble position) -- distinct from the 0x40 (IP packet data) SAP
+		// this firmware's own Confirmed/Unconfirmed Data headers use.
+		if ((isDefinedShortOrRaw ? (sapType != 0xA0U) : (sapType != 0x40U)) ||
+			(blocks == 0U) || (blocks > SMS_MAX_RX_DATA_BLOCKS) || (pad >= SMS_BLOCK_DATA_BYTES))
 		{
 			smsResetRxAssembly();
 			return false;
@@ -3205,14 +3598,30 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 		rxAssembly.responseRequested = responseRequested;
 		rxAssembly.ackProfile = ackProfile;
 		rxAssembly.sourceId = sourceId;
+		// Defined Short/Raw Data is a delivery-confirmed service at the protocol level: ack it
+		// once fully assembled regardless of whether our heuristics can read the text back out,
+		// same as a real handset would. Without this the sending network keeps retransmitting.
+		rxAssembly.alwaysAck = isDefinedShortOrRaw;
 		memset(smsRxPayloadBuffer, 0, sizeof(smsRxPayloadBuffer));
 		return true;
 	}
 
 	if (((dataType == 0x07U) || (dataType == 0x08U)) && rxAssembly.active)
 	{
+		// dataType 0x08 is a rate 3/4 data burst, which carries more payload per block than the
+		// rate 1/2 bursts (dataType 0x07) SMS_BLOCK_DATA_BYTES was sized for -- frameLength
+		// reflects however many bytes HR-C6000.c actually read for this specific burst type
+		// (SMS_RATE34_DATA_LENGTH vs LC_DATA_LENGTH), so derive the payload size from that
+		// instead of the fixed rate-1/2 block size.
 		uint8_t blockHeaderBytes = ((dataType == 0x08U) ? 2U : 0U);
-		uint8_t blockPayloadBytes = (uint8_t)(SMS_BLOCK_DATA_BYTES - blockHeaderBytes);
+
+		if (frameLength <= blockHeaderBytes)
+		{
+			smsResetRxAssembly();
+			return false;
+		}
+
+		uint8_t blockPayloadBytes = (uint8_t)(frameLength - blockHeaderBytes);
 		const uint8_t *blockPayload = &frame[blockHeaderBytes];
 
 		if (rxAssembly.receivedBlocks >= rxAssembly.expectedBlocks)
@@ -3250,6 +3659,7 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 				rxDecodePending.responseRequested = rxAssembly.responseRequested;
 				rxDecodePending.ackProfile = rxAssembly.ackProfile;
 				rxDecodePending.sourceId = rxAssembly.sourceId;
+				rxDecodePending.alwaysAck = rxAssembly.alwaysAck;
 				rxDecodePending.active = true;
 			}
 
@@ -3576,7 +3986,10 @@ smsPackResult_t smsQueueSentMessage(uint8_t index, uint32_t sourceId)
 		return SMS_PACK_ERROR_INVALID_INDEX;
 	}
 
-	return smsQueueMessage(message.destinationId, sourceId, message.text);
+	// Sent-message storage doesn't record which format the original send used, so resend
+	// always uses the Motorola-format encoder (this firmware's default), matching the format
+	// this same message would have originally been queued with prior to per-send format choice.
+	return smsQueueMessage(message.destinationId, sourceId, message.text, SMS_ENCODER_MOTOROLA);
 }
 
 bool smsHasRxNotification(void)

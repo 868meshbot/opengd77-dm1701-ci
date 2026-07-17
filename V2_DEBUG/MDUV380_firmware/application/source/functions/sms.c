@@ -2293,7 +2293,7 @@ void smsDebugTapAirFrame(uint8_t syncClass, uint8_t dataType, bool crcOk, bool r
 	#endif
 }
 
-bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
+bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame, uint8_t frameLength)
 {
 	char debugLine[120U];
 	uint16_t debugIndex = 0U;
@@ -2306,7 +2306,14 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 	if (dataType == 0x06U)
 	{
 		uint8_t dataPacketFormat = (uint8_t)(frame[0] & 0x0FU);
-		bool responseRequested = (((frame[0] & 0x40U) != 0U) || (dataPacketFormat == 0x03U));
+		// Real-world network SMS gateways (BrandMeister/MOTOTRBO-style) deliver text via the
+		// Defined Short Data / Raw Short Data DPF, not the Confirmed/Unconfirmed Data DPF this
+		// firmware uses for its own radio-to-radio sends. That header lays out the "blocks to
+		// follow" field differently (top of byte 0 + bottom of byte 1, per ETSI TS 102 361-2 /
+		// MMDVMHost's DMRDataHeader.cpp DPF_DEFINED_SHORT case) and repurposes byte 1's upper
+		// nibble, so it can't be validated against the SAP/pad layout used for the other DPFs.
+		bool isDefinedShortOrRaw = ((dataPacketFormat == 0x0DU) || (dataPacketFormat == 0x0EU));
+		bool responseRequested = (((frame[0] & 0x40U) != 0U) || (dataPacketFormat == 0x03U) || isDefinedShortOrRaw);
 		#if SMS_RX_DEBUG_DISABLE_ACK
 		responseRequested = false;
 		#endif
@@ -2327,10 +2334,24 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 		}
 
 		uint8_t sapType = (uint8_t)(frame[1] & 0xF0U);
-		uint8_t blocks = (uint8_t)(frame[8] & 0x7FU);
-		uint8_t pad = (uint8_t)((frame[0] & 0x10U) | (frame[1] & 0x0FU));
+		uint8_t blocks;
+		uint8_t pad;
 
-		if ((sapType != 0x40U) || (blocks == 0U) || (blocks > SMS_MAX_DATA_BLOCKS) || (pad >= SMS_BLOCK_DATA_BYTES))
+		if (isDefinedShortOrRaw)
+		{
+			blocks = (uint8_t)((frame[0] & 0x30U) + (frame[1] & 0x0FU));
+			pad = 0U;
+		}
+		else
+		{
+			blocks = (uint8_t)(frame[8] & 0x7FU);
+			pad = (uint8_t)((frame[0] & 0x10U) | (frame[1] & 0x0FU));
+		}
+
+		// Per ETSI TS 102 361-1 9.2.12, a Defined (Short/Raw) Data header's SAP identifier is
+		// 0b1010 (0xA0 in this nibble position) -- distinct from the 0x40 (IP packet data) SAP
+		// this firmware's own Confirmed/Unconfirmed Data headers use.
+		if ((isDefinedShortOrRaw ? (sapType != 0xA0U) : (sapType != 0x40U)) || (blocks == 0U) || (blocks > SMS_MAX_DATA_BLOCKS) || (pad >= SMS_BLOCK_DATA_BYTES))
 		{
 			smsDebugLogLine("SMSRX H06 rejected: sap/blocks/pad invalid");
 			smsResetRxAssembly();
@@ -2398,8 +2419,21 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 
 	if (((dataType == 0x07U) || (dataType == 0x08U)) && rxAssembly.active)
 	{
+		// dataType 0x08 is a rate 3/4 data burst, which carries more payload per block than the
+		// rate 1/2 bursts (dataType 0x07) SMS_BLOCK_DATA_BYTES was sized for -- frameLength
+		// reflects however many bytes HR-C6000.c actually read for this specific burst type
+		// (SMS_RATE34_DATA_LENGTH vs LC_DATA_LENGTH), so derive the payload size from that
+		// instead of the fixed rate-1/2 block size.
 		uint8_t blockHeaderBytes = ((dataType == 0x08U) ? 2U : 0U);
-		uint8_t blockPayloadBytes = (uint8_t)(SMS_BLOCK_DATA_BYTES - blockHeaderBytes);
+
+		if (frameLength <= blockHeaderBytes)
+		{
+			smsDebugLogLine("SMSRX D07/D08 rejected: frame too short for header");
+			smsResetRxAssembly();
+			return false;
+		}
+
+		uint8_t blockPayloadBytes = (uint8_t)(frameLength - blockHeaderBytes);
 		const uint8_t *blockPayload = &frame[blockHeaderBytes];
 
 		if (rxAssembly.receivedBlocks >= rxAssembly.expectedBlocks)
@@ -2409,15 +2443,17 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 			return false;
 		}
 
-		if ((rxAssembly.rawBytesReceived + SMS_BLOCK_DATA_BYTES) > sizeof(smsRxRawPayload))
+		if ((rxAssembly.rawBytesReceived + frameLength) > sizeof(smsRxRawPayload))
 		{
 			smsDebugLogLine("SMSRX D07/D08 rejected: raw payload overflow");
 			smsResetRxAssembly();
 			return false;
 		}
 
-		memcpy(&smsRxRawPayload[rxAssembly.rawBytesReceived], frame, SMS_BLOCK_DATA_BYTES);
-		rxAssembly.rawBytesReceived = (uint16_t)(rxAssembly.rawBytesReceived + SMS_BLOCK_DATA_BYTES);
+		// Rate 3/4 bursts (dataType 0x08) are frameLength bytes, not the fixed rate-1/2
+		// SMS_BLOCK_DATA_BYTES -- see the blockPayloadBytes derivation above for why.
+		memcpy(&smsRxRawPayload[rxAssembly.rawBytesReceived], frame, frameLength);
+		rxAssembly.rawBytesReceived = (uint16_t)(rxAssembly.rawBytesReceived + frameLength);
 		if (dataType == 0x08U)
 		{
 			rxAssembly.sawDataType08 = true;
@@ -2787,7 +2823,7 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame)
 	if (((dataType == 0x07U) || (dataType == 0x08U)) && (!rxAssembly.active))
 	{
 		#if SMS_RX_DEBUG_VERBOSE_DUMPS
-		smsDebugDumpBytes(((dataType == 0x08U) ? "D08-ORPHAN" : "D07-ORPHAN"), frame, SMS_BLOCK_DATA_BYTES, SMS_BLOCK_DATA_BYTES);
+		smsDebugDumpBytes(((dataType == 0x08U) ? "D08-ORPHAN" : "D07-ORPHAN"), frame, frameLength, frameLength);
 		#endif
 		smsDebugLogLine("SMSRX D07/D08 dropped: no active assembly");
 	}
