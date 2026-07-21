@@ -173,6 +173,21 @@ real STM32CubeIDE compiler locally (see "Headless Build" above), so a
 separate CI pipeline wasn't providing anything CI's plain-GCC package could
 actually reproduce.
 
+## SMS
+
+This firmware adds SMS text messaging (send/receive) on top of upstream
+OpenGD77, including receiving messages relayed in from real DMR networks
+(e.g. BrandMeister) rather than only radio-to-radio. If you plan to use
+BrandMeister's TextCapture (store-and-forward SMS) feature, read
+[`DOCUMENTATIE/brandmeister_textcapture.md`](DOCUMENTATIE/brandmeister_textcapture.md)
+first — it explains, in plain terms, what that feature requires from the
+radio (an ACK after every received message, or BrandMeister will keep
+resending the same message for up to 7 days) and which of this repo's radio
+trees actually do that correctly today.
+
+For day-to-day usage of the SMS menu itself, see
+[`DOCUMENTATIE/HOW_TO_USE_SMS.md`](DOCUMENTATIE/HOW_TO_USE_SMS.md).
+
 ## Notes
 
 - This repo contains older documentation in `DOCUMENTATIE/BUILD.md`, but that describes a different toolchain and is not authoritative for this STM32CubeIDE workspace.

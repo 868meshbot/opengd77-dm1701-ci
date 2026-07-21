@@ -82,3 +82,10 @@ strengere SAP-validatie voor Defined Short/Raw Data headers, en een
 gedocumenteerde beperking: een echte Anytone-compatibele (Defined Short
 Data) *encoder* is momenteel niet mogelijk omdat de TX-hardwarepad alleen
 rate-1/2 blocks ondersteunt.
+
+## BrandMeister TextCapture / ACK-gedrag
+
+Zie [`brandmeister_textcapture.md`](brandmeister_textcapture.md) (Engels) voor
+uitleg, in gewone taal, of dit firmware correct ACKt zoals BrandMeister's
+TextCapture (store-and-forward SMS) vereist, en welke radio-trees dat gedrag
+hebben.
