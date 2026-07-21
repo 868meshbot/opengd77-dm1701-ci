@@ -59,3 +59,35 @@ you're on `MD9600_RT90` or `V2_STM32-MOB`, the fix is present and builds
 clean, but hasn't been proven on real hardware yet — treat it as
 provisionally working, and it'd be worth one real test message before relying
 on it. Don't enable TextCapture on a `V2_DEBUG` build at all.
+
+## Known remaining issue: BrandMeister can still redeliver despite a correct ACK
+
+Real hardware testing after the ACK fix above showed the radio sending a
+correct low-level Response PDU ACK (`smsQueueAckResponseMessage()`, DPF
+`0x01`, ETSI Transport ACK) for every message it receives, yet BrandMeister's
+TextCapture sometimes kept redelivering the same message anyway.
+
+An automatic reply of the literal text `"CK"` was tried as a workaround, on
+the theory that BrandMeister's TextCapture specifically wants an
+application-level "Motorola-style" SMS ACK rather than (or in addition to)
+the ETSI transport ACK. **This made things worse, not better, and was fully
+reverted.** With auto-reply enabled, BrandMeister relayed the radio's own
+`"CK"` reply back to it as if it were a brand new incoming message (source
+and destination DMR ID are identical for a TextCapture self-reply), which the
+radio then correctly received and ACKed — triggering another reply, another
+redelivery, and so on. This was confirmed from real captured logs showing the
+radio's own reply content looping back as "new" traffic, not guessed from
+symptoms alone.
+
+**Current state:** no auto-reply code is present in any tree. The ETSI
+Transport ACK from `smsQueueAckResponseMessage()` is the only ACK this
+firmware sends, and it fires correctly and unconditionally for every
+recognised inbound message. Whether BrandMeister's redelivery behavior is
+fully resolved by that ACK alone, by a BrandMeister self-care protocol
+setting (ETSI vs. Motorola vs. "Chinese radio" — changing this setting
+changes the wire format BrandMeister uses, and was observed to change/reduce
+the redelivery pattern in testing), or requires something else entirely,
+**remains unresolved and is not a firmware-side bug to keep chasing.** If you
+see repeated redelivery, treat it as a BrandMeister/hotspot-side issue first:
+check the self-care TextCapture/SMS protocol setting, and if it persists,
+raise it with BrandMeister/hotspot support rather than the radio.

@@ -88,4 +88,18 @@ rate-1/2 blocks ondersteunt.
 Zie [`brandmeister_textcapture.md`](brandmeister_textcapture.md) (Engels) voor
 uitleg, in gewone taal, of dit firmware correct ACKt zoals BrandMeister's
 TextCapture (store-and-forward SMS) vereist, en welke radio-trees dat gedrag
-hebben.
+hebben. Bevat ook waarom een automatische "CK"-antwoordfunctie is geprobeerd
+en weer volledig teruggedraaid (veroorzaakte een self-loop via BrandMeister),
+en waarom herhaalde aflevering door BrandMeister nog steeds als
+niet-firmware-probleem wordt beschouwd.
+
+## Latere fix: gedupliceerde tekst bij ontvangst (V3_TEST, MD9600_RT90, V2_STM32-MOB)
+
+Zie de secties "Symptom 4" en "Symptom 5" in
+[`sms_network_relay_decode_fixes.md`](sms_network_relay_decode_fixes.md) voor
+een fix van een bug waarbij ontvangen SMS-tekst gedupliceerd werd
+weergegeven (bijv. "adgjmptw" -> "adgjmptwadgjmptw"), veroorzaakt door
+ontbrekende "is de tekst al goed gedecodeerd"-checks tussen meerdere
+decodeerstrategieën. Deze fix is doorgevoerd in alle drie de volledig
+geporte trees (`V3_TEST`, `MD9600_RT90`, `V2_STM32-MOB`); `V2_DEBUG` heeft
+zijn eigen decodeerimplementatie en is hier bewust buiten gelaten.

@@ -163,6 +163,81 @@ behaviour (no datasheet access to confirm reading 18 bytes at that SPI
 address yields real data rather than garbage past byte 12) -- it was only
 confirmed correct by trying it on real hardware and checking the result.
 
+## Symptom 4: decoded text duplicated (e.g. "ADGJMPTW" -> "ADGJMPTWADGJMPTW")
+
+After the symptom 1-3 fixes above, real-world testing against BrandMeister
+TextCapture turned up a new bug: decoded SMS text was sometimes duplicated,
+e.g. sending `adgjmptw` produced `adgjmptwadgjmptw` in the inbox, and sending
+`MW0AXD` produced `MW0AXDW0AXDAXD`. This was diagnosed entirely from real CDC
+serial captures with `SMS_DEBUG_USB_SERIAL` re-enabled (see below), across
+several passes as each fix revealed the next layer of the bug.
+
+**Root cause (general shape):** `smsDecodeCurrentRxBuffers()` runs several
+decode strategies in sequence -- a direct windowed read at the known
+Motorola/Standard text offset, a "neighborhood" scan around that offset, a
+scan of a UDP-payload offset, and whole-buffer fallback scans -- each gated
+on `smsDecodedTextIsPoor(decodedText)` so that a later, worse strategy
+shouldn't run once a good decode already exists. Several of these gates were
+missing or incomplete, so a correct decode from an earlier stage kept getting
+re-scanned by a later stage, and the (garbage or offset-shifted) result got
+spliced onto the already-correct text via `smsMergeDecodedCandidate()`'s
+character-by-character extension merge -- producing the tail of the same
+message appended a second time, at a shifted alignment.
+
+Three separate gaps were found and fixed, each confirmed against a distinct
+real capture:
+
+1. **Motorola-window neighborhood scan** ran unconditionally after the
+   direct-window decode, even when that direct decode had already succeeded.
+   Fixed by wrapping it in `if (smsDecodedTextIsPoor(decodedText))`.
+   Confirmed via a capture showing `"MW0AXD"` decode correctly once, then
+   get re-scanned and merged into `"MW0AXDW0AXDAXD"`.
+
+2. **Standard-window guard was ad hoc and incomplete.** The prior code used
+   `bool allowStandardWindow = true;` plus a narrow Motorola-only check,
+   which didn't cover the case where Stage 1 (`smsDecodeStandardPayload`)
+   had already produced a good decode. Replaced with
+   `bool allowStandardWindow = smsDecodedTextIsPoor(decodedText);`, a single
+   correct guard covering both cases.
+
+3. **UDP-payload-offset window was completely unguarded.** This block ran
+   whenever a Motorola or Standard port was recognised and
+   `udpPayloadLength > 0`, regardless of whether an earlier stage had
+   already decoded the message correctly -- and because this offset starts
+   *before* the real text offset, it re-included header bytes as leading
+   garbage followed by the same real text again. Confirmed via a capture of
+   a sent `"wxy"` test message coming back as `"a\n\n                    WXY"`.
+   Fixed by adding `&& smsDecodedTextIsPoor(decodedText)` to the outer `if`
+   that guards the whole block, not just the neighborhood-scan fallback
+   inside it.
+
+## Symptom 5: short (2-character) messages like "CK" still duplicated after the symptom-4 fixes
+
+Even with all three gates above in place, a 2-character message ("CK", used
+as a diagnostic during the BrandMeister ACK investigation) still came back
+duplicated, while 3+ character messages ("DMW", "TEST AXD", "123") decoded
+cleanly. The difference: `smsScoreDecodedText()` unconditionally rejects any
+candidate shorter than 3 characters (returns its minimum/worst score), as a
+guard against short garbage from the whole-buffer fallback scans. That
+guard, applied uniformly, also rejected short-but-*correct* primary-offset
+reads -- so a correct 2-character decode was never "trusted", `decodedText`
+stayed poor, and every later fallback stage still ran and corrupted it.
+
+**Fix:** added a dedicated read of the primary offset (Motorola text offset
+if a Motorola signature/port was recognised, else the Standard text offset)
+directly into `decodedText` *before* the existing Stage 2 logic runs, bypassing
+`smsScoreDecodedText()`'s length gate entirely for this one read -- it's the
+mathematically correct offset for this message, not a speculative scan, so
+the usual noise-rejection reasoning doesn't apply to it. Later stages still
+only run if this primary read fails to produce anything
+(`smsDecodedTextIsPoor` still gates them).
+
+Note: this fix is logically sound and code-reviewed against the same
+duplication mechanism as symptom 4, but the specific live BrandMeister
+traffic that would have exercised a short message stopped (server-side)
+before a fresh confirming capture could be taken. Treat it as
+provisionally-fixed pending one more real 2-character message test.
+
 ## Re-enabling the debug serial dump
 
 If you need to capture raw SMS payload bytes again in the future (e.g. to
