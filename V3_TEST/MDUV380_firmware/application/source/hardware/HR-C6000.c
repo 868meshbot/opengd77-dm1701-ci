@@ -30,6 +30,13 @@
 #include "hardware/HR-C6000.h"
 #include "functions/settings.h"
 #include "functions/sms.h"
+#include "functions/csbk.h"
+#include "usb/usb_com.h"
+
+// Diagnostic logging used to root-cause the Call Alert / Radio Check TX-hang investigation
+// (root cause: menuDataGlobal.data[] array-length mismatch in menuSystem.c, now fixed).
+// Left in place, off by default, mirroring sms.c's SMS_DEBUG_USB_SERIAL pattern.
+#define CSBK_DEBUG_USB_SERIAL 0
 #if defined(USING_EXTERNAL_DEBUGGER)
 #include "SeggerRTT/RTT/SEGGER_RTT.h"
 #endif
@@ -1078,6 +1085,17 @@ static inline void hrc6000SysReceivedDataInt(void)
 		(void)smsHandleReceivedDataFrame((uint8_t)rxDataType, dataSyncBuf, dataSyncReadLength);
 	}
 
+	// Standalone CSBK bursts (Call Alert / Radio Check), as opposed to the CSBK preamble that
+	// precedes an SMS data header -- dataSyncBuf/dataSyncReadOk are already populated for any
+	// data-sync-class frame above, this just adds a consumer for rxDataType == 3 (CSBK).
+	if (hrc6000CrcIsValid() && isDataSyncFrame && (rxDataType == 3) && dataSyncReadOk)
+	{
+#if CSBK_DEBUG_USB_SERIAL
+		USB_DEBUG_printf("CSBK RX frame len=%u byte0=0x%02x\r\n", (unsigned)dataSyncReadLength, dataSyncBuf[0]);
+#endif
+		csbkHandleReceivedFrame(dataSyncBuf, dataSyncReadLength);
+	}
+
 	if (hrc6000CrcIsValid() && (slotState != DMR_STATE_IDLE) && (hrc.skipCount > 0) && (rxSyncClass != SYNC_CLASS_DATA) && ((rxDataType & 0x07) == 0x01))
 	{
 		hrc.skipCount--;
@@ -1909,6 +1927,10 @@ void hrc6000TimeslotInterruptHandler(void)
 		case DMR_STATE_TX_END_1: // Stop TX (first step)
 			if (hrc.smsActive)
 			{
+#if CSBK_DEBUG_USB_SERIAL
+				USB_DEBUG_printf("TX_END_1: smsActive TX complete, frameIndex=%u frameCount=%u\r\n",
+					(unsigned)hrc.smsFrameIndex, (unsigned)hrc.smsFrameCount);
+#endif
 				hrc.smsActive = false;
 				smsNotifyOutgoingSent();
 				SPI0WritePageRegByte(0x04, 0x41, 0x00);
@@ -2928,6 +2950,38 @@ bool HRC6000StartQueuedSMS(void)
 	if ((message == NULL) || (trxGetMode() != RADIO_MODE_DIGITAL) || trxTransmissionEnabled || trxIsTransmitting || !slotStateReady)
 	{
 		return false;
+	}
+
+	if (message->csbkOnly)
+	{
+		// Standalone CSBK service (Call Alert / Radio Check): the CSBK bytes are the whole PDU,
+		// already fully built (opcode, addresses, CRC) -- just repeat them verbatim, unlike the
+		// Preamble CSBK loop below which mutates byte[3] and recomputes the CRC each repeat.
+		preambleCount = message->csbkRepeatCount;
+		hrc.smsPreambleCount = preambleCount;
+
+#if CSBK_DEBUG_USB_SERIAL
+		USB_DEBUG_printf("HRC6000StartQueuedSMS: csbkOnly branch, repeatCount=%u slotState=%d\r\n",
+			(unsigned)preambleCount, (int)slotState);
+#endif
+
+		for (uint8_t repeat = 0U; repeat < hrc.smsPreambleCount; repeat++)
+		{
+			memcpy(hrc.smsFrames[frameIndex], message->csbk, LC_DATA_LENGTH);
+			frameIndex++;
+		}
+
+		hrc.smsFrameCount = frameIndex;
+		hrc.smsFrameIndex = 0U;
+		hrc.smsActive = true;
+		smsClearQueuedMessage();
+
+#if CSBK_DEBUG_USB_SERIAL
+		USB_DEBUG_printf("HRC6000StartQueuedSMS: csbkOnly frameCount=%u, enabling TX\r\n", (unsigned)hrc.smsFrameCount);
+#endif
+		HRC6000ClearIsWakingState();
+		trxEnableTransmission();
+		return true;
 	}
 
 	if ((message->blockCount == 0U) &&

@@ -52,6 +52,7 @@
 #include "interfaces/adc.h"
 #include "functions/rxPowerSaving.h"
 #include "functions/sms.h"
+#include "functions/csbk.h"
 
 #if defined(USING_EXTERNAL_DEBUGGER)
 #include "SeggerRTT/RTT/SEGGER_RTT.h"
@@ -497,6 +498,7 @@ void applicationMainTask(void)
 	lastHeardInitList();
 	codeplugInitCaches();
 	smsInit();
+	csbkInit();
 	dmrIDCacheInit();
 
 	// Need to take care if the user has already been fully notified about the settings update
@@ -1381,6 +1383,7 @@ void applicationMainTask(void)
 		aprsBeaconingTick(&ev);
 		smsTick();
 		smsInboxStorageTick();
+		csbkTick();
 
 		switch (smsConsumeTxEvent())
 		{
@@ -1430,6 +1433,39 @@ void applicationMainTask(void)
 			case SMS_TX_EVENT_NONE:
 			default:
 				break;
+		}
+
+		{
+			uint32_t csbkResultId;
+			csbkKind_t csbkResultKind;
+			csbkPendingState_t csbkResult = csbkGetPendingResult(&csbkResultId, &csbkResultKind);
+
+			if (csbkResult == CSBK_PENDING_ACKED)
+			{
+				char line[SCREEN_LINE_BUFFER_SIZE];
+				soundSetMelody(MELODY_ACK_BEEP);
+				snprintf(line, sizeof(line), "%s: %lu OK", ((csbkResultKind == CSBK_KIND_CALL_ALERT) ? "Alert" : "Check"), (unsigned long)csbkResultId);
+				uiNotificationShow(NOTIFICATION_TYPE_MESSAGE, NOTIFICATION_ID_SMS_TX, 2500U, line, true);
+			}
+			else if (csbkResult == CSBK_PENDING_TIMEOUT)
+			{
+				char line[SCREEN_LINE_BUFFER_SIZE];
+				soundSetMelody(MELODY_NACK_BEEP);
+				snprintf(line, sizeof(line), "%s: %lu no answer", ((csbkResultKind == CSBK_KIND_CALL_ALERT) ? "Alert" : "Check"), (unsigned long)csbkResultId);
+				uiNotificationShow(NOTIFICATION_TYPE_MESSAGE, NOTIFICATION_ID_SMS_TX, 2500U, line, true);
+			}
+		}
+
+		{
+			smsStatusNotification_t statusNotification;
+
+			if (smsConsumeStatusRxNotification(&statusNotification))
+			{
+				char line[SCREEN_LINE_BUFFER_SIZE];
+				soundSetMelody(MELODY_ACK_BEEP);
+				snprintf(line, sizeof(line), "Status %u from %lu", statusNotification.statusCode, (unsigned long)statusNotification.sourceId);
+				uiNotificationShow(NOTIFICATION_TYPE_MESSAGE, NOTIFICATION_ID_SMS_TX, 2500U, line, true);
+			}
 		}
 
 		settingsSaveIfNeeded(false);

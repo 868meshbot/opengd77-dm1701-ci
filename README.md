@@ -188,6 +188,13 @@ trees actually do that correctly today.
 For day-to-day usage of the SMS menu itself, see
 [`DOCUMENTATIE/HOW_TO_USE_SMS.md`](DOCUMENTATIE/HOW_TO_USE_SMS.md).
 
+The SMS menu (V3_TEST) also has three related DMR services: Call Alert, Radio Check, and
+Status. See
+[`DOCUMENTATIE/csbk_call_alert_radio_check_status.md`](DOCUMENTATIE/csbk_call_alert_radio_check_status.md)
+for what each does, which parts are hardware-confirmed vs. still unverified (the CSBK opcode
+values in particular), and a real crash bug it surfaced in the menu system that's worth knowing
+about before adding any other new menu screens.
+
 ## Notes
 
 - This repo contains older documentation in `DOCUMENTATIE/BUILD.md`, but that describes a different toolchain and is not authoritative for this STM32CubeIDE workspace.

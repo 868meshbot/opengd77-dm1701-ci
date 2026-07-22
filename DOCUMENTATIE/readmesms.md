@@ -83,6 +83,16 @@ gedocumenteerde beperking: een echte Anytone-compatibele (Defined Short
 Data) *encoder* is momenteel niet mogelijk omdat de TX-hardwarepad alleen
 rate-1/2 blocks ondersteunt.
 
+## Nieuwe DMR services: Call Alert, Radio Check en Status (V3_TEST)
+
+Zie [`csbk_call_alert_radio_check_status.md`](csbk_call_alert_radio_check_status.md) (Engels)
+voor Call Alert en Radio Check (losstaande CSBK-berichten, hergebruiken de geteste SMS-CSBK-
+verzendmachine via een nieuwe `csbkOnly`-vlag) en Status (een enkele numerieke code via hetzelfde
+geteste SDS-transport als tekst-SMS, met een eigen SAP-waarde). Bevat ook een echte, gevonden en
+opgeloste crash-bug in `menuSystem.c` (`menuDataGlobal.data[]` liep niet meer synchroon met de
+`MENU_SCREENS` enum) die relevant is voor elke toekomstige nieuwe menu-toevoeging in deze
+codebase.
+
 ## BrandMeister TextCapture / ACK-gedrag
 
 Zie [`brandmeister_textcapture.md`](brandmeister_textcapture.md) (Engels) voor

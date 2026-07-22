@@ -45,6 +45,13 @@
 #define SMS_QUICKTEXT_MAX_MESSAGES    10U
 #define SMS_QUICKTEXT_MAX_TITLE_LENGTH 16U
 
+// SAP nibble (top 4 bits of dataHeader[1]) used for OpenGD77-fork-internal Status messages.
+// ETSI TS 102 361-1 reserves SAP value 9 for "Proprietary Packet Data", which is exactly what
+// this is: a single-byte status code, not a real-text SMS. This is a fork-internal convention,
+// not a documented cross-vendor standard -- only guaranteed to interoperate between radios
+// running this same firmware.
+#define SMS_STATUS_SAP_NIBBLE         0x90U
+
 typedef enum
 {
 	SMS_PACK_OK = 0,
@@ -85,10 +92,22 @@ typedef struct
 	uint8_t padOctetCount;
 	uint8_t blockCount;
 	bool requestAck;
+	// When csbkOnly is set, HRC6000StartQueuedSMS() repeats `csbk` csbkRepeatCount times and sends
+	// nothing else (no dataHeader/blocks frame) -- used for standalone CSBK services (Call Alert,
+	// Radio Check) that are a complete PDU in themselves, unlike SMS's CSBK-preamble-then-data-header
+	// shape. Every existing caller leaves this false, so existing SMS TX behaviour is unchanged.
+	bool csbkOnly;
+	uint8_t csbkRepeatCount;
 	uint8_t csbk[SMS_BLOCK_DATA_BYTES];
 	uint8_t dataHeader[SMS_BLOCK_DATA_BYTES];
 	uint8_t blocks[SMS_MAX_DATA_BLOCKS][SMS_BLOCK_DATA_BYTES];
 } smsPreparedMessage_t;
+
+typedef struct
+{
+	uint32_t sourceId;
+	uint8_t statusCode;
+} smsStatusNotification_t;
 
 typedef struct
 {
@@ -141,5 +160,18 @@ bool smsRetryLastOutgoingMessage(void);
 smsTxEvent_t smsConsumeTxEvent(void);
 void smsTick(void);
 void smsInboxStorageTick(void);
+
+// Used by csbk.c to queue a standalone, already-built CSBK-only burst (Call Alert / Radio Check)
+// through the same tested TX queue slot and state machine SMS uses. Fails if a message is already
+// queued -- callers should check smsHasQueuedMessage() / HRC6000IsSendingSMS() first.
+bool smsQueueRawCsbkMessage(const uint8_t *csbkFrame, uint8_t repeatCount);
+
+// OpenGD77-fork-internal Status messages: a single numeric code (looked up against a local table
+// on both ends) sent over the same tested Confirmed/Unconfirmed Data transport SMS text uses, just
+// with a 1-byte payload and a distinct (proprietary) SAP so it isn't mistaken for text.
+smsPackResult_t smsQueueStatusMessage(uint32_t destinationId, uint32_t sourceId, uint8_t statusCode);
+bool smsScheduleQueuedStatusTransmission(uint32_t destinationId, uint32_t sourceId);
+bool smsHasStatusRxNotification(void);
+bool smsConsumeStatusRxNotification(smsStatusNotification_t *notification);
 
 #endif

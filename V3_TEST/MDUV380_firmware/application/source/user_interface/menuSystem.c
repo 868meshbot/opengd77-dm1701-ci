@@ -106,10 +106,13 @@ menuDataGlobal_t menuDataGlobal =
 				NULL,// SMS menu
 				NULL,// SMS compose
 				NULL,// SMS inbox
+				NULL,// SMS quicktext
+				NULL,// SMS quicktext edit
 				NULL,// SMS rx popup
 				NULL,// SMS view
 				NULL,// SMS sent
 				NULL,// SMS options
+				NULL,// CSBK actions
 #if defined(HAS_COLOURS)
 				NULL,// Theme items browser
 				NULL,// Colour picker
@@ -177,6 +180,7 @@ static menuFunctionData_t menuFunctions[] =
 		{ menuSMSView,              NULL, NULL, 0 },
 		{ menuSMSSent,              NULL, NULL, 0 },
 		{ menuSMSOptions,           NULL, NULL, 0 },
+		{ menuCsbkActions,          NULL, NULL, 0 },
 #if defined(HAS_COLOURS)
 		{ menuThemeItemsBrowser,    NULL, NULL, 0 },
 		{ menuColourPicker,         NULL, NULL, 0 },

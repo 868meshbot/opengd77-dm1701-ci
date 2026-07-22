@@ -167,6 +167,20 @@ typedef struct
 typedef struct
 {
 	bool active;
+	uint32_t sourceId;
+	bool responseRequested;
+} smsStatusAssembly_t;
+
+typedef struct
+{
+	bool pending;
+	uint32_t sourceId;
+	uint8_t statusCode;
+} smsStatusRxNotification_t;
+
+typedef struct
+{
+	bool active;
 	uint32_t destinationId;
 	uint8_t ackProfile;
 	ticksTimer_t delayTimer;
@@ -211,6 +225,8 @@ enum
 };
 static __attribute__((section(".ccmram"))) char smsDecodeTextBuffers[SMS_DECODE_BUF_COUNT][SMS_MAX_TEXT_LENGTH + 1U];
 static smsRxAssembly_t rxAssembly = { 0 };
+static smsStatusAssembly_t statusAssembly = { 0 };
+static smsStatusRxNotification_t statusRxNotification = { 0 };
 static volatile smsRxDecodePending_t rxDecodePending = { 0 };
 static smsAckResponseTracking_t ackResponseTracking = { 0 };
 static smsOutgoingTracking_t outgoingTracking = { 0 };
@@ -226,6 +242,7 @@ static void smsResetRxAssembly(void);
 static void smsScheduleAckResponse(uint32_t destinationId, uint8_t ackProfile);
 static bool smsQueueAckResponseMessage(uint32_t destinationId, uint32_t sourceId, uint8_t ackProfile);
 static uint16_t smsCrc16Ccitt(const uint8_t *data, uint8_t length);
+static void smsBuildStatusDataHeader(smsPreparedMessage_t *message);
 static void smsResetOutgoingTracking(void);
 static void smsResetOutgoingStartTracking(void);
 static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, smsTxEvent_t startEvent);
@@ -2105,6 +2122,7 @@ static bool __attribute__((unused)) smsDecodeUtf8PayloadByScan(const uint8_t *pa
 static void smsResetRxAssembly(void)
 {
 	memset(&rxAssembly, 0, sizeof(rxAssembly));
+	memset(&statusAssembly, 0, sizeof(statusAssembly));
 	memset(smsRxPayloadBuffer, 0, sizeof(smsRxPayloadBuffer));
 }
 
@@ -2782,6 +2800,31 @@ static void smsBuildDataHeader(smsPreparedMessage_t *message)
 	message->dataHeader[11] = (uint8_t)(crc & 0xFFU) ^ 0xCCU;
 }
 
+// Same Confirmed/Unconfirmed Data header shape as smsBuildDataHeader(), but tagged with
+// SMS_STATUS_SAP_NIBBLE instead of the normal IP/UDP SAP so smsHandleReceivedDataFrame() can
+// route it to the 1-byte status-code path instead of the text decode pipeline. Always exactly
+// one data block (the status code, padded to fill the block).
+static void smsBuildStatusDataHeader(smsPreparedMessage_t *message)
+{
+	uint16_t crc;
+
+	memset(message->dataHeader, 0, sizeof(message->dataHeader));
+	message->dataHeader[0] = 0x42U;
+	message->dataHeader[1] = (uint8_t)(SMS_STATUS_SAP_NIBBLE | 0x0BU);           // SAP=proprietary(9) + pad=11 (only byte 0 of the block is meaningful)
+	message->dataHeader[2] = (uint8_t)((message->destinationId >> 16) & 0xFFU);
+	message->dataHeader[3] = (uint8_t)((message->destinationId >> 8) & 0xFFU);
+	message->dataHeader[4] = (uint8_t)(message->destinationId & 0xFFU);
+	message->dataHeader[5] = (uint8_t)((message->sourceId >> 16) & 0xFFU);
+	message->dataHeader[6] = (uint8_t)((message->sourceId >> 8) & 0xFFU);
+	message->dataHeader[7] = (uint8_t)(message->sourceId & 0xFFU);
+	message->dataHeader[8] = (uint8_t)(0x80U | (message->blockCount & 0x7FU));   // Full packet, N blocks
+	message->dataHeader[9] = 0x00U;                                               // Fragment #0
+
+	crc = smsCrc16Ccitt(message->dataHeader, 10U);
+	message->dataHeader[10] = (uint8_t)((crc >> 8) & 0xFFU) ^ 0xCCU;            // DMR Data Header CRC mask
+	message->dataHeader[11] = (uint8_t)(crc & 0xFFU) ^ 0xCCU;
+}
+
 static smsPackResult_t smsConvertTextToUtf16LeUpper(const char *text, uint8_t *payload, uint16_t *payloadLength)
 {
 	uint16_t index = 0;
@@ -2927,6 +2970,96 @@ void smsClearQueuedMessage(void)
 {
 	queuedMessageValid = false;
 	memset(&queuedMessage, 0, sizeof(queuedMessage));
+}
+
+bool smsQueueRawCsbkMessage(const uint8_t *csbkFrame, uint8_t repeatCount)
+{
+	if ((csbkFrame == NULL) || (repeatCount == 0U) || queuedMessageValid)
+	{
+		return false;
+	}
+
+	memset(&queuedMessage, 0, sizeof(queuedMessage));
+	queuedMessage.csbkOnly = true;
+	queuedMessage.csbkRepeatCount = repeatCount;
+	memcpy(queuedMessage.csbk, csbkFrame, sizeof(queuedMessage.csbk));
+	queuedMessageValid = true;
+
+	return true;
+}
+
+smsPackResult_t smsQueueStatusMessage(uint32_t destinationId, uint32_t sourceId, uint8_t statusCode)
+{
+	if (queuedMessageValid)
+	{
+		return SMS_PACK_ERROR_INVALID_INDEX;
+	}
+
+	if ((destinationId == 0U) || (destinationId > 0x00FFFFFFU))
+	{
+		return SMS_PACK_ERROR_INVALID_DEST;
+	}
+
+	if ((sourceId == 0U) || (sourceId > 0x00FFFFFFU))
+	{
+		return SMS_PACK_ERROR_INVALID_SRC;
+	}
+
+	memset(&queuedMessage, 0, sizeof(queuedMessage));
+	queuedMessage.destinationId = destinationId;
+	queuedMessage.sourceId = sourceId;
+	queuedMessage.requestAck = true;
+	queuedMessage.blockCount = 1U;
+	memset(queuedMessage.blocks[0], 0, SMS_BLOCK_DATA_BYTES);
+	queuedMessage.blocks[0][0] = statusCode;
+
+	smsBuildCsbk(&queuedMessage);
+	smsBuildStatusDataHeader(&queuedMessage);
+	queuedMessageValid = true;
+
+	return SMS_PACK_OK;
+}
+
+bool smsScheduleQueuedStatusTransmission(uint32_t destinationId, uint32_t sourceId)
+{
+	if (!queuedMessageValid || outgoingTracking.active || outgoingStartTracking.active ||
+		HRC6000IsSendingSMS() || HRC6000IRQHandlerIsRunning())
+	{
+		return false;
+	}
+
+	outgoingStartTracking.active = true;
+	outgoingStartTracking.waitForAck = false;
+	outgoingStartTracking.storeSent = false;
+	outgoingStartTracking.destinationId = destinationId;
+	outgoingStartTracking.sourceId = sourceId;
+	outgoingStartTracking.startEvent = SMS_TX_EVENT_SENDING;
+	outgoingStartTracking.text[0] = 0;
+	ticksTimerStart(&outgoingStartTracking.startTimer, SMS_TX_START_TIMEOUT_MS);
+
+	return true;
+}
+
+bool smsHasStatusRxNotification(void)
+{
+	return statusRxNotification.pending;
+}
+
+bool smsConsumeStatusRxNotification(smsStatusNotification_t *notification)
+{
+	if (!statusRxNotification.pending)
+	{
+		return false;
+	}
+
+	if (notification != NULL)
+	{
+		notification->sourceId = statusRxNotification.sourceId;
+		notification->statusCode = statusRxNotification.statusCode;
+	}
+
+	statusRxNotification.pending = false;
+	return true;
 }
 
 static void smsStartOutgoingTracking(uint32_t destinationId, uint32_t sourceId, const char *text, smsEncoderFormat_t format, bool waitForAck, smsTxEvent_t startEvent)
@@ -3628,6 +3761,17 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame, uint8_t 
 
 		sourceId = (((uint32_t)frame[5] << 16) | ((uint32_t)frame[6] << 8) | frame[7]);
 
+		// OpenGD77-fork-internal Status message (see SMS_STATUS_SAP_NIBBLE) -- always exactly one
+		// data block, so it's handled as a fully self-contained mini-transaction here rather than
+		// going through the multi-block rxAssembly state machine the text path uses below.
+		if (!isDefinedShortOrRaw && (sapType == SMS_STATUS_SAP_NIBBLE) && (blocks == 1U))
+		{
+			statusAssembly.active = true;
+			statusAssembly.sourceId = sourceId;
+			statusAssembly.responseRequested = responseRequested;
+			return true;
+		}
+
 		// Legacy/original firmwares can send valid inbound SMS headers as format 0x01
 		// without setting the explicit response-request markers.
 		if (!responseRequested && (dataPacketFormat == 0x01U))
@@ -3682,6 +3826,26 @@ bool smsHandleReceivedDataFrame(uint8_t dataType, const uint8_t *frame, uint8_t 
 		// same as a real handset would. Without this the sending network keeps retransmitting.
 		rxAssembly.alwaysAck = isDefinedShortOrRaw;
 		memset(smsRxPayloadBuffer, 0, sizeof(smsRxPayloadBuffer));
+		return true;
+	}
+
+	if (((dataType == 0x07U) || (dataType == 0x08U)) && statusAssembly.active)
+	{
+		uint8_t blockHeaderBytes = ((dataType == 0x08U) ? 2U : 0U);
+
+		if (frameLength > blockHeaderBytes)
+		{
+			statusRxNotification.pending = true;
+			statusRxNotification.sourceId = statusAssembly.sourceId;
+			statusRxNotification.statusCode = frame[blockHeaderBytes];
+		}
+
+		if (statusAssembly.responseRequested && (statusAssembly.sourceId != 0U))
+		{
+			smsScheduleAckResponse(statusAssembly.sourceId, SMS_ACK_PROFILE_MODERN);
+		}
+
+		memset(&statusAssembly, 0, sizeof(statusAssembly));
 		return true;
 	}
 
